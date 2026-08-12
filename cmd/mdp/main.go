@@ -39,6 +39,7 @@ import (
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/store/sqlite"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/strategy"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/supervise"
+	tgbot "github.com/Rextrc/real-time-market-data-pipeline/internal/telegram"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/venue"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/venue/binance"
 )
@@ -89,6 +90,10 @@ type config struct {
 	alpacaAllowLive   bool
 	alpacaMaxPosition float64
 	alpacaEvalEvery   time.Duration
+
+	telegramEnabled     bool
+	telegramChatID      int64
+	telegramMaxNotional float64
 }
 
 // env reads a configuration value from the environment, falling back to a
@@ -187,6 +192,10 @@ func run() error {
 	flag.BoolVar(&c.alpacaAllowLive, "alpaca-allow-live", envBool("MDP_ALPACA_ALLOW_LIVE", false), "required in addition to a non-paper -alpaca-base-url before any real-money order can be sent")
 	flag.Float64Var(&c.alpacaMaxPosition, "alpaca-max-position", envFloat("MDP_ALPACA_MAX_POSITION", 0.1), "max fraction of account equity per Alpaca position")
 	flag.DurationVar(&c.alpacaEvalEvery, "alpaca-eval-interval", envDur("MDP_ALPACA_EVAL_INTERVAL", 2*time.Minute), "how often the Alpaca engine evaluates and can trade")
+
+	flag.BoolVar(&c.telegramEnabled, "telegram", envBool("MDP_TELEGRAM", false), "enable a Telegram bot that places real Alpaca orders from chat messages (needs TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALPACA_API_KEY, ALPACA_API_SECRET)")
+	flag.Int64Var(&c.telegramChatID, "telegram-chat-id", int64(envInt("TELEGRAM_CHAT_ID", 0)), "the only chat ID the bot will act on — see GETTING_STARTED.md for how to find yours")
+	flag.Float64Var(&c.telegramMaxNotional, "telegram-max-notional", envFloat("MDP_TELEGRAM_MAX_NOTIONAL", 1000), "hard dollar cap per order placed from Telegram, independent of Alpaca's own limits")
 	flag.Parse()
 
 	log := newLogger(c.logLevel)
@@ -351,6 +360,12 @@ func run() error {
 
 	if c.alpacaEnabled {
 		if err := wireAlpaca(ctx, c, b, builder, instruments, log, g); err != nil {
+			return err
+		}
+	}
+
+	if c.telegramEnabled {
+		if err := wireTelegram(ctx, c, log, g); err != nil {
 			return err
 		}
 	}
@@ -566,6 +581,51 @@ func wireAlpaca(
 	log.Warn("ALPACA EXECUTION ENABLED — this engine submits real orders",
 		"broker", client.Name(), "strategy", strat.Name(),
 		"max_position_fraction", c.alpacaMaxPosition, "eval_interval", c.alpacaEvalEvery)
+	return nil
+}
+
+// wireTelegram connects a Telegram bot that places real Alpaca orders from
+// chat messages. It builds its own Alpaca client independent of wireAlpaca's
+// — both are stateless REST clients against the same account, and keeping
+// them separate means this path works whether or not -alpaca's automated
+// engine is also running.
+func wireTelegram(ctx context.Context, c config, log *slog.Logger, g *errgroup.Group) error {
+	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	if botToken == "" {
+		return errors.New("-telegram requires TELEGRAM_BOT_TOKEN")
+	}
+	if c.telegramChatID == 0 {
+		return errors.New("-telegram requires -telegram-chat-id / TELEGRAM_CHAT_ID — see GETTING_STARTED.md for how to find yours")
+	}
+
+	key := os.Getenv("ALPACA_API_KEY")
+	secret := os.Getenv("ALPACA_API_SECRET")
+	if key == "" || secret == "" {
+		return errors.New("-telegram requires ALPACA_API_KEY and ALPACA_API_SECRET")
+	}
+
+	registry := instrument.NewRegistry()
+	if err := registry.Register(binance.Symbols()...); err != nil {
+		return err
+	}
+
+	client, err := alpaca.New(alpaca.Config{
+		APIKey: key, APISecret: secret,
+		BaseURL: c.alpacaBaseURL, AllowLive: c.alpacaAllowLive,
+	}, registry, log.With("broker", "alpaca"))
+	if err != nil {
+		return err
+	}
+	if err := client.Ping(ctx); err != nil {
+		return fmt.Errorf("telegram: alpaca startup check failed: %w", err)
+	}
+
+	bot := tgbot.NewBot(tgbot.BotConfig{
+		AllowedChatID:    c.telegramChatID,
+		MaxOrderNotional: c.telegramMaxNotional,
+	}, tgbot.New(botToken), client, log.With("component", "telegram"))
+
+	g.Go(func() error { return bot.Run(ctx) })
 	return nil
 }
 

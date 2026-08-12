@@ -223,6 +223,64 @@ automated trading risky in the first place:
 
 ---
 
+## Trading from Telegram
+
+Text the bot an instruction, it executes it against Alpaca — same account,
+same paper-by-default interlock as above. This is a manual, on-demand path
+alongside the automated strategies, not a replacement for them: it exists
+for "buy 2 shares of AAPL with a take profit of 160 and stop loss of 140"
+typed as a sentence.
+
+```sh
+export ALPACA_API_KEY=...
+export ALPACA_API_SECRET=...
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_CHAT_ID=...
+go run ./cmd/mdp -telegram
+```
+
+See `GETTING_STARTED.md` step 5 for getting a bot token from @BotFather and
+finding your chat ID.
+
+```
+buy 2 shares of AAPL
+buy 2 shares of AAPL with a take profit of 160 and stop loss of 140
+buy 2 AAPL tp 5% sl 3%
+buy $500 of tesla
+sell 2 shares of AAPL
+close AAPL          (sells the whole position)
+price AAPL
+positions
+status
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-telegram` | off | enable the bot |
+| `-telegram-chat-id` | — | the only chat ID the bot acts on; required |
+| `-telegram-max-notional` | `1000` | hard dollar cap per order, independent of Alpaca's own limits |
+
+Three things keep a typo from being expensive:
+
+- **One allowed chat.** Anyone who finds the bot's username can message it,
+  but only `TELEGRAM_CHAT_ID` gets a response or an order — everything else
+  is logged and silently ignored (no "not authorized" reply, so a stranger
+  probing it learns nothing).
+- **Fails closed on ambiguity.** The parser is regex-based, not an LLM, on
+  purpose: an instruction either matches a known shape or comes back with
+  exactly what it couldn't find ("couldn't find a stock symbol in..."). It
+  never guesses at intent for something this consequential.
+- **A `sell` only ever closes or trims a position the bot can see.** If you
+  don't hold the symbol, or ask to sell more than you hold, it does nothing
+  and says so rather than opening a short.
+
+Take-profit/stop-loss are submitted as a real Alpaca bracket order — Alpaca
+manages both exit legs and cancels whichever didn't fire, so the position
+still exits correctly even if this process is redeployed or crashes between
+the entry filling and the target being hit.
+
+---
+
 ## Backpressure — the part worth understanding
 
 Every consumer gets **its own queue** and declares **its own policy**. Sharing

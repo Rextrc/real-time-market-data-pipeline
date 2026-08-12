@@ -132,7 +132,39 @@ flags — see the README's *Real orders* section before you ever go near
 
 ---
 
-## 5. Deploy straight to Railway
+## 5. (Optional) Trade by texting it
+
+Lets you text the bot things like `buy 2 shares of AAPL with a take profit
+of 160 and stop loss of 140` and it executes them against your Alpaca
+account (same paper-by-default safety as above — same keys, same interlock).
+
+1. Message [@BotFather](https://t.me/BotFather) on Telegram, send `/newbot`,
+   follow the prompts. It gives you a token that looks like
+   `123456789:AAH...`.
+2. Send your new bot any message (Telegram won't let it message you first).
+3. Find your chat ID: open
+   `https://api.telegram.org/bot<your token>/getUpdates` in a browser — it's
+   the `"chat":{"id": ...}` number in the reply. This is what locks the bot
+   to only you; without it anyone who finds the bot's username could place
+   orders on your account.
+4. Run:
+
+```sh
+export ALPACA_API_KEY=...
+export ALPACA_API_SECRET=...
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_CHAT_ID=...
+go run ./cmd/mdp -telegram
+```
+
+Text your bot `help` to see the command list, or just try `buy 1 shares of
+AAPL`. `-telegram-max-notional` (default `$1000`, env
+`MDP_TELEGRAM_MAX_NOTIONAL`) caps how big a single order it'll place no
+matter what you type — raise it once you trust the parsing, not before.
+
+---
+
+## 6. Deploy straight to Railway
 
 No local Go, no terminal commands on your machine at all — Railway builds
 the repo's Dockerfile and runs it. This is the "upload it and it's running"
@@ -184,8 +216,11 @@ Optional additions to the same variable block:
   `llm` — see step 3 above for why you also want `MDP_EVAL_INTERVAL=15m` if
   you do this.
 - `ALPACA_API_KEY` / `ALPACA_API_SECRET` for real paper-account orders — see
-  step 4 above; also add `MDP_ALPACA=true` and `MDP_ALPACA_STRATEGY=momentum`
+  step 4 above; also add `MDP_ALPACA=true` and `MDP_ALPACA_STRATEGY=adaptive`
   to the variables.
+- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` (plus the same `ALPACA_API_KEY` /
+  `ALPACA_API_SECRET` above) for the Telegram bot from step 5 — also add
+  `MDP_TELEGRAM=true`.
 
 **Step 5 — save.** Railway redeploys automatically whenever you change a
 variable or push to the branch. Watch the **Deployments** tab; once it says
@@ -215,6 +250,7 @@ Full sizing tables, retention tuning, and LLM cost breakdown are in the
 | Check the scoreboard | `curl -s localhost:8080/v1/paper \| jq .` |
 | Check a live price | `curl -s localhost:8080/v1/quote/BTC-USDT \| jq .` |
 | Watch for backpressure problems | `curl -s localhost:8080/metrics \| jq .subscribers` |
+| Trade by texting the bot | see step 5 above; then just text it `buy 2 shares of AAPL` |
 | Break it on purpose | see README → *Deliberately breaking it* |
 
 If something doesn't start, the error is almost always one of: Go version

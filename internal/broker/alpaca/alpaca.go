@@ -30,6 +30,7 @@ import (
 	"time"
 
 	alpacasdk "github.com/alpacahq/alpaca-trade-api-go/v3/alpaca"
+	marketdata "github.com/alpacahq/alpaca-trade-api-go/v3/marketdata"
 	"github.com/shopspring/decimal"
 
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/broker"
@@ -69,6 +70,7 @@ var ErrLiveNotAllowed = errors.New(
 // Client is an Alpaca paper (or, if explicitly allowed, live) broker.
 type Client struct {
 	sdk      *alpacasdk.Client
+	data     *marketdata.Client
 	baseURL  string
 	registry symbolMapper
 	log      *slog.Logger
@@ -100,8 +102,16 @@ func New(cfg Config, reg symbolMapper, log *slog.Logger) (*Client, error) {
 		APISecret: cfg.APISecret,
 		BaseURL:   base,
 	})
+	// Market data lives on its own host and isn't part of the paper/live
+	// split above — the same feed serves both account types, keyed only by
+	// the API key's own entitlement. Quotes are read-only, so there's
+	// nothing for checkBaseURL to guard here.
+	data := marketdata.NewClient(marketdata.ClientOpts{
+		APIKey:    cfg.APIKey,
+		APISecret: cfg.APISecret,
+	})
 
-	c := &Client{sdk: sdk, baseURL: base, registry: reg, log: log}
+	c := &Client{sdk: sdk, data: data, baseURL: base, registry: reg, log: log}
 	if u, err := url.Parse(base); err == nil && base != PaperBaseURL && !isLoopback(u.Hostname()) {
 		log.Warn("alpaca client configured against a non-paper endpoint",
 			"base_url", base, "note", "orders placed through this client will use real funds")
