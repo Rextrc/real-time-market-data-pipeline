@@ -11,6 +11,7 @@ import (
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/bus"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/consumer/candles"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/model"
+	"github.com/Rextrc/real-time-market-data-pipeline/internal/store"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/strategy"
 )
 
@@ -35,14 +36,22 @@ type EngineConfig struct {
 	StatePath string
 	// SaveInterval is how often the book is written.
 	SaveInterval time.Duration
+	// History, if set, receives a periodic equity snapshot — this is what
+	// lets a dashboard draw an equity curve instead of only ever showing
+	// the current number. Nil disables it; the account still works, there
+	// is just no history to chart.
+	History store.EquityRecorder
+	// HistoryInterval is how often a snapshot is recorded.
+	HistoryInterval time.Duration
 }
 
 func DefaultEngineConfig() EngineConfig {
 	return EngineConfig{
-		EvalInterval: 15 * time.Second,
-		FillLatency:  500 * time.Millisecond,
-		MarkInterval: 5 * time.Second,
-		SaveInterval: 30 * time.Second,
+		EvalInterval:    15 * time.Second,
+		FillLatency:     500 * time.Millisecond,
+		MarkInterval:    5 * time.Second,
+		SaveInterval:    30 * time.Second,
+		HistoryInterval: 5 * time.Minute,
 	}
 }
 
@@ -81,6 +90,9 @@ func NewEngine(
 	}
 	if cfg.SaveInterval <= 0 {
 		cfg.SaveInterval = d.SaveInterval
+	}
+	if cfg.HistoryInterval <= 0 {
+		cfg.HistoryInterval = d.HistoryInterval
 	}
 	return &Engine{
 		cfg: cfg, acct: acct, strat: strat, builder: builder,
@@ -139,8 +151,15 @@ func (e *Engine) Run(ctx context.Context, sub bus.Subscription) error {
 	defer markTicker.Stop()
 	saveTicker := time.NewTicker(e.cfg.SaveInterval)
 	defer saveTicker.Stop()
+	historyTicker := time.NewTicker(e.cfg.HistoryInterval)
+	defer historyTicker.Stop()
 
 	defer e.save()
+
+	// Record one point at startup rather than waiting a full interval, so a
+	// freshly (re)started engine has a curve immediately instead of a flat
+	// line for the first several minutes.
+	e.recordHistory(ctx)
 
 	for {
 		select {
@@ -159,6 +178,9 @@ func (e *Engine) Run(ctx context.Context, sub bus.Subscription) error {
 
 		case <-saveTicker.C:
 			e.save()
+
+		case <-historyTicker.C:
+			e.recordHistory(ctx)
 
 		case <-evalTicker.C:
 			e.evaluate(ctx)
@@ -209,6 +231,33 @@ func (e *Engine) prices() map[model.InstrumentID]model.Decimal {
 		out[id] = t.Price
 	}
 	return out
+}
+
+// recordHistory writes one equity snapshot. Best-effort: a failed write here
+// costs one point off a chart, not the run itself, so it logs and moves on
+// rather than propagating an error that would tear down the engine.
+func (e *Engine) recordHistory(ctx context.Context) {
+	if e.cfg.History == nil {
+		return
+	}
+
+	now := time.Now().UTC()
+	snap := e.acct.Snapshot(now)
+
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+
+	err := e.cfg.History.RecordEquity(writeCtx, store.EquitySnapshot{
+		Strategy:     e.Name(),
+		Time:         now,
+		Equity:       snap.Equity,
+		RealizedPL:   snap.RealizedPL,
+		UnrealizedPL: snap.UnrealizedPL,
+		Trades:       snap.Trades,
+	})
+	if err != nil {
+		e.log.Warn("equity history write failed", "err", err)
+	}
 }
 
 func (e *Engine) save() {

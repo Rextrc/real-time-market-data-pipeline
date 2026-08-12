@@ -1,0 +1,779 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mdp — trading dashboard</title>
+<style>
+/* ---- design tokens -----------------------------------------------------
+   Light values live on bare :root. Dark values are redefined twice: once
+   under the OS media query (guarded so an explicit light choice always
+   wins), once under [data-theme="dark"] (so the in-page toggle always
+   wins). This is the documented pattern for a page that must render
+   correctly under "system", forced light, and forced dark alike. */
+:root {
+  color-scheme: light;
+  --surface:        #fcfcfb;
+  --plane:          #f9f9f7;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #898781;
+  --gridline:       #e1e0d9;
+  --baseline:       #c3c2b7;
+  --border:         rgba(11,11,11,0.10);
+  --good:           #0ca30c;
+  --good-text:      #006300;
+  --warning:        #fab219;
+  --serious:        #ec835a;
+  --critical:       #d03b3b;
+  --critical-text:  #b23030;
+  /* categorical, fixed order — never reassigned by rank, only by identity */
+  --s1: #2a78d6; /* blue */
+  --s2: #eb6834; /* orange */
+  --s3: #1baf7a; /* aqua */
+  --s4: #eda100; /* yellow */
+  --s5: #e87ba4; /* magenta */
+  --s6: #008300; /* green */
+  --s7: #4a3aa7; /* violet */
+  --s8: #e34948; /* red */
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --surface:        #1a1a19;
+    --plane:          #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --good:           #0ca30c;
+    --good-text:      #0ca30c;
+    --warning:        #fab219;
+    --serious:        #ec835a;
+    --critical:       #d03b3b;
+    --critical-text:  #e66767;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface:        #1a1a19;
+  --plane:          #0d0d0d;
+  --text-primary:   #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted:     #898781;
+  --gridline:       #2c2c2a;
+  --baseline:       #383835;
+  --border:         rgba(255,255,255,0.10);
+  --good:           #0ca30c;
+  --good-text:      #0ca30c;
+  --warning:        #fab219;
+  --serious:        #ec835a;
+  --critical:       #d03b3b;
+  --critical-text:  #e66767;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  background: var(--plane);
+  color: var(--text-primary);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1160px; margin: 0 auto; padding: 20px 20px 56px; }
+
+/* header */
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+header h1 { font-size: 18px; font-weight: 600; margin: 0; }
+header h1 span { color: var(--text-muted); font-weight: 400; }
+.hdr-right { display: flex; align-items: center; gap: 10px; }
+#staleBadge { display: none; font-size: 12px; color: var(--critical-text); border: 1px solid var(--critical); border-radius: 5px; padding: 2px 8px; }
+#staleBadge.show { display: inline-block; }
+#updated { font-size: 12px; color: var(--text-muted); tabular-nums: 1; font-variant-numeric: tabular-nums; }
+button.theme-btn {
+  font: inherit; font-size: 12px; color: var(--text-secondary);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 10px; cursor: pointer;
+}
+button.theme-btn:hover { color: var(--text-primary); }
+
+/* layout primitives */
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 16px 18px; margin-bottom: 16px;
+}
+.card h2 { font-size: 13px; font-weight: 600; margin: 0 0 12px; color: var(--text-primary); }
+.card h2 small { font-weight: 400; color: var(--text-muted); margin-left: 6px; }
+.empty { color: var(--text-muted); font-size: 13px; padding: 8px 0; }
+
+/* stat tiles */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.tile .label { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+.tile .value { font-size: 22px; font-weight: 600; }
+.tile .delta { font-size: 12px; margin-top: 4px; }
+.up { color: var(--good-text); }
+.down { color: var(--critical-text); }
+.flat { color: var(--text-muted); }
+
+/* tables */
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; font-weight: 500; color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; padding: 0 10px 8px; border-bottom: 1px solid var(--gridline); }
+td { padding: 8px 10px; border-bottom: 1px solid var(--gridline); vertical-align: middle; }
+tr:last-child td { border-bottom: none; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; flex: none; vertical-align: -1px; }
+.name-cell { display: flex; align-items: center; }
+.mono { font-variant-numeric: tabular-nums; }
+.reason { color: var(--text-secondary); font-size: 12.5px; }
+.badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 4px; letter-spacing: .02em; }
+.badge.buy { background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good-text); }
+.badge.sell { background: color-mix(in srgb, var(--critical) 16%, transparent); color: var(--critical-text); }
+.badge.ok { background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good-text); }
+.badge.warn { background: color-mix(in srgb, var(--warning) 22%, transparent); color: var(--text-primary); }
+.badge.crit { background: color-mix(in srgb, var(--critical) 18%, transparent); color: var(--critical-text); }
+.table-scroll { overflow-x: auto; }
+
+/* chart */
+.chart-legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; font-size: 12px; color: var(--text-secondary); }
+.chart-legend .item { display: flex; align-items: center; gap: 6px; }
+.chart-legend .swatch { width: 14px; height: 2px; border-radius: 1px; }
+.chart-wrap { position: relative; }
+svg.chart { display: block; width: 100%; height: 260px; overflow: visible; }
+.crosshair { stroke: var(--baseline); stroke-width: 1; pointer-events: none; }
+.tooltip {
+  position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.18);
+  display: none; white-space: nowrap; z-index: 5;
+}
+.tooltip .t-time { color: var(--text-muted); margin-bottom: 5px; }
+.tooltip .row { display: flex; align-items: center; gap: 6px; }
+.tooltip .row + .row { margin-top: 3px; }
+.tooltip .key { width: 12px; height: 2px; border-radius: 1px; }
+.tooltip .val { font-weight: 600; margin-left: auto; padding-left: 14px; font-variant-numeric: tabular-nums; }
+.tooltip .nm { color: var(--text-secondary); }
+details.tv { margin-top: 10px; }
+details.tv summary { cursor: pointer; font-size: 12px; color: var(--text-secondary); }
+details.tv summary:hover { color: var(--text-primary); }
+
+/* meters (queue health) */
+.meters { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.meter { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.meter .mhead { display: flex; justify-content: space-between; align-items: center; font-size: 12.5px; margin-bottom: 8px; }
+.meter .mhead .nm { font-weight: 600; }
+.track { height: 6px; border-radius: 3px; background: var(--gridline); overflow: hidden; margin-bottom: 8px; }
+.fill { height: 100%; border-radius: 3px; }
+.fill.ok { background: var(--s1); }
+.fill.warn { background: var(--warning); }
+.fill.crit { background: var(--critical); }
+.mfoot { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--text-muted); }
+
+/* tickers */
+.tickers { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+.ticker { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.ticker .sym { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+.ticker .px { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ticker .dchg { font-size: 11.5px; margin-top: 2px; }
+
+footer { text-align: center; color: var(--text-muted); font-size: 12px; margin-top: 28px; }
+footer a { color: inherit; }
+
+@media (max-width: 620px) {
+  .wrap { padding: 14px 14px 40px; }
+  header { flex-direction: column; align-items: flex-start; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>mdp <span>— real-time market data pipeline</span></h1>
+    <div class="hdr-right">
+      <span id="staleBadge">stale data</span>
+      <span id="updated">—</span>
+      <button class="theme-btn" id="themeBtn" type="button">theme: auto</button>
+    </div>
+  </header>
+
+  <div class="tiles" id="overviewTiles"></div>
+
+  <div class="card">
+    <h2>Strategy scoreboard <small>same tick stream, same fees — every strategy runs it fair</small></h2>
+    <div id="scoreboardWrap" class="table-scroll"><p class="empty">Loading…</p></div>
+  </div>
+
+  <div class="card">
+    <h2>Equity curves <small id="equitySub"></small></h2>
+    <div id="equityWrap"><p class="empty">Loading…</p></div>
+  </div>
+
+  <div class="card">
+    <h2>Live prices</h2>
+    <div id="tickersWrap"><p class="empty">Loading…</p></div>
+  </div>
+
+  <div class="card">
+    <h2>Recent trades <small>every fill, with the reason it fired</small></h2>
+    <div id="tradesWrap" class="table-scroll"><p class="empty">Loading…</p></div>
+  </div>
+
+  <div class="card">
+    <h2>Pipeline health <small>per-consumer backpressure — one queue each, never shared</small></h2>
+    <div id="metersWrap"><p class="empty">Loading…</p></div>
+  </div>
+
+  <div class="card">
+    <h2>Archive</h2>
+    <div id="archiveWrap"><p class="empty">Loading…</p></div>
+  </div>
+
+  <footer>
+    auto-refreshes every 5s · <a href="/metrics">/metrics</a> · <a href="/v1/paper">/v1/paper</a> ·
+    <a href="https://github.com/Rextrc/real-time-market-data-pipeline" target="_blank" rel="noopener">source</a>
+  </footer>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+'use strict';
+
+/* ---------------------------------------------------------------------
+   Theme toggle: auto (follow OS) -> light -> dark -> auto. Stored so a
+   returning visitor keeps their choice; "auto" is the default and clears
+   the stored override entirely rather than storing the word "auto",
+   which is what lets the OS media query in the CSS keep working.
+--------------------------------------------------------------------- */
+(function initTheme() {
+  const btn = document.getElementById('themeBtn');
+  const apply = () => {
+    const saved = localStorage.getItem('mdp-theme');
+    if (saved === 'light' || saved === 'dark') {
+      document.documentElement.setAttribute('data-theme', saved);
+      btn.textContent = 'theme: ' + saved;
+    } else {
+      document.documentElement.removeAttribute('data-theme');
+      btn.textContent = 'theme: auto';
+    }
+  };
+  btn.addEventListener('click', () => {
+    const saved = localStorage.getItem('mdp-theme');
+    const next = saved === 'light' ? 'dark' : saved === 'dark' ? null : 'light';
+    if (next) localStorage.setItem('mdp-theme', next);
+    else localStorage.removeItem('mdp-theme');
+    apply();
+  });
+  apply();
+})();
+
+/* ---------------------------------------------------------------------
+   Formatting helpers. Every price/quantity/money field from the API
+   arrives as a JSON *string* (the Go side never emits a bare number for
+   money — see model.Decimal.MarshalJSON), so parseFloat is the one and
+   only place precision gets touched, and only for display.
+--------------------------------------------------------------------- */
+const moneyFmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const numFmt = new Intl.NumberFormat('en-US');
+function money(v) { const n = parseFloat(v); return Number.isFinite(n) ? moneyFmt.format(n) : '—'; }
+function num(v) { const n = Number(v); return Number.isFinite(n) ? numFmt.format(n) : '—'; }
+function pct(v, digits) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '—';
+  return (n > 0 ? '+' : '') + n.toFixed(digits ?? 2) + '%';
+}
+function deltaClass(n) { return n > 0 ? 'up' : n < 0 ? 'down' : 'flat'; }
+function fmtBytes(b) {
+  if (!Number.isFinite(b)) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = b;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+}
+function fmtUptime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const d = Math.floor(sec / 86400); sec -= d * 86400;
+  const h = Math.floor(sec / 3600); sec -= h * 3600;
+  const m = Math.floor(sec / 60);
+  if (d > 0) return d + 'd ' + h + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
+function relTime(iso) {
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return '—';
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 5) return 'just now';
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  return Math.floor(s / 3600) + 'h ago';
+}
+function timeShort(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '—';
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+function dateShort(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '—';
+  return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+
+/* ---------------------------------------------------------------------
+   Strategy identity -> color. Fixed categorical order, assigned by name
+   (never by array position, so a reordered API response can't repaint
+   an existing series a different color). New/unknown strategy names
+   still get a stable slot the first time they're seen, sorted
+   alphabetically so the assignment is a pure function of the name set.
+--------------------------------------------------------------------- */
+const SLOTS = ['--s1', '--s2', '--s3', '--s4', '--s5', '--s6', '--s7', '--s8'];
+let colorMap = {};
+function assignColors(names) {
+  const sorted = [...names].sort();
+  const next = {};
+  sorted.forEach((n, i) => { next[n] = SLOTS[i % SLOTS.length]; });
+  colorMap = next;
+}
+function colorOf(name) {
+  const varName = colorMap[name] || '--s1';
+  return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+}
+
+/* ---------------------------------------------------------------------
+   Fetching. AbortController bounds every request so one hung connection
+   (a redeploying container, a cold Railway wake-up) can't stall the
+   whole poll loop indefinitely.
+--------------------------------------------------------------------- */
+async function getJSON(url, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 8000);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
+    if (!res.ok) {
+      if (res.status === 404) return null; // feature not enabled server-side — not an error
+      throw new Error(url + ': HTTP ' + res.status);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ---------------------------------------------------------------------
+   State
+--------------------------------------------------------------------- */
+const state = {
+  lastOK: 0,
+  instruments: [],       // configured instrument IDs
+  firstPrice: {},        // instrument -> price at page load, for the "since load" delta
+  equity: {},             // strategy name -> [{t (ms), equity, realized, unrealized}]
+  equityLastPoint: {},    // strategy name -> ISO time of the newest point we have
+};
+
+/* ---------------------------------------------------------------------
+   Overview tiles
+--------------------------------------------------------------------- */
+function renderOverview(health, metrics, paperList) {
+  const el = document.getElementById('overviewTiles');
+  const tiles = [];
+
+  tiles.push(tile('Uptime', health ? fmtUptime(health.uptime_sec) : '—'));
+
+  if (paperList && paperList.length) {
+    let equity = 0, pl = 0, startCash = 0;
+    paperList.forEach(s => {
+      equity += parseFloat(s.account.equity) || 0;
+      pl += parseFloat(s.account.total_pl) || 0;
+      startCash += parseFloat(s.account.starting_cash) || 0;
+    });
+    const retPct = startCash > 0 ? (pl / startCash) * 100 : 0;
+    tiles.push(tile('Total equity (all strategies)', moneyFmt.format(equity)));
+    tiles.push(tile('Total P&L', moneyFmt.format(pl), pct(retPct), deltaClass(pl)));
+  }
+
+  if (metrics && metrics.archive) {
+    tiles.push(tile('Archive size', fmtBytes(metrics.archive.bytes)));
+    tiles.push(tile('Ticks stored', num(metrics.archive.ticks)));
+  }
+
+  el.innerHTML = tiles.join('');
+}
+function tile(label, value, delta, deltaCls) {
+  return '<div class="tile"><div class="label">' + esc(label) + '</div><div class="value">' + esc(value) + '</div>'
+    + (delta ? '<div class="delta ' + (deltaCls || '') + '">' + esc(delta) + '</div>' : '')
+    + '</div>';
+}
+
+/* ---------------------------------------------------------------------
+   Scoreboard
+--------------------------------------------------------------------- */
+function renderScoreboard(paperList) {
+  const wrap = document.getElementById('scoreboardWrap');
+  if (!paperList || !paperList.length) {
+    wrap.innerHTML = '<p class="empty">Paper trading is not enabled. Set <code>MDP_PAPER=true</code> (and <code>MDP_STRATEGY</code>) to see strategy performance here.</p>';
+    return;
+  }
+  const rows = paperList.map(s => {
+    const a = s.account;
+    const pl = parseFloat(a.total_pl) || 0;
+    const dd = Number(a.max_drawdown_pct) || 0;
+    return '<tr>'
+      + '<td class="name-cell"><span class="dot" style="background:' + colorOf(s.name) + '"></span>' + esc(s.name) + '</td>'
+      + '<td class="num mono">' + money(a.equity) + '</td>'
+      + '<td class="num mono ' + deltaClass(pl) + '">' + money(a.total_pl) + '</td>'
+      + '<td class="num mono ' + deltaClass(Number(a.return_pct)) + '">' + pct(a.return_pct) + '</td>'
+      + '<td class="num mono">' + num(a.trades) + '</td>'
+      + '<td class="num mono">' + num(a.wins) + '/' + num(a.losses) + '</td>'
+      + '<td class="num mono">' + money(a.fees_paid) + '</td>'
+      + '<td class="num mono ' + (dd > 0 ? 'down' : 'flat') + '">' + dd.toFixed(2) + '%</td>'
+      + '</tr>';
+  }).join('');
+  wrap.innerHTML = '<table><thead><tr>'
+    + '<th>Strategy</th><th class="num">Equity</th><th class="num">P&amp;L</th><th class="num">Return</th>'
+    + '<th class="num">Trades</th><th class="num">W/L</th><th class="num">Fees</th><th class="num">Max DD</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
+/* ---------------------------------------------------------------------
+   Equity curve — hand-rolled SVG line chart (no charting library: the
+   whole point of this dashboard is that it's part of the Go binary with
+   zero build step and zero external requests).
+
+   Mark spec: 2px lines round-capped, 8px end markers with a 2px surface
+   ring, hairline gridlines, direct label at each line's endpoint, a
+   crosshair + one shared tooltip on hover, and a plain-HTML table view
+   underneath as the always-available non-chart form of the same data.
+--------------------------------------------------------------------- */
+function niceStep(rough) {
+  if (rough <= 0) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+  const norm = rough / mag;
+  const step = norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10;
+  return step * mag;
+}
+
+function renderEquityChart(names) {
+  const wrap = document.getElementById('equityWrap');
+  const sub = document.getElementById('equitySub');
+  const series = names
+    .map(n => ({ name: n, points: state.equity[n] || [] }))
+    .filter(s => s.points.length > 0);
+
+  if (!series.length) {
+    wrap.innerHTML = '<p class="empty">No equity history yet — the first snapshot is recorded a few seconds after startup, then every few minutes after that.</p>';
+    sub.textContent = '';
+    return;
+  }
+  sub.textContent = 'since ' + dateShort(series.reduce((min, s) => s.points[0].t < min ? s.points[0].t : min, Infinity));
+
+  const W = 1000, H = 260, padL = 54, padR = 16, padT = 12, padB = 26;
+  let tMin = Infinity, tMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+  series.forEach(s => s.points.forEach(p => {
+    if (p.t < tMin) tMin = p.t;
+    if (p.t > tMax) tMax = p.t;
+    if (p.equity < vMin) vMin = p.equity;
+    if (p.equity > vMax) vMax = p.equity;
+  }));
+  if (tMin === tMax) tMax = tMin + 1;
+  const vPad = Math.max((vMax - vMin) * 0.08, 1);
+  vMin -= vPad; vMax += vPad;
+
+  const x = t => padL + ((t - tMin) / (tMax - tMin)) * (W - padL - padR);
+  const y = v => padT + (1 - (v - vMin) / (vMax - vMin)) * (H - padT - padB);
+
+  // gridlines + y ticks on clean numbers
+  const step = niceStep((vMax - vMin) / 4);
+  const ticks = [];
+  for (let v = Math.ceil(vMin / step) * step; v <= vMax; v += step) ticks.push(v);
+
+  let svg = '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">';
+  ticks.forEach(v => {
+    const yy = y(v);
+    svg += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + yy + '" y2="' + yy + '" stroke="var(--gridline)" stroke-width="1"/>';
+    svg += '<text x="' + (padL - 8) + '" y="' + (yy + 4) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + moneyFmt.format(v).replace('.00', '') + '</text>';
+  });
+  svg += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + (H - padB) + '" y2="' + (H - padB) + '" stroke="var(--baseline)" stroke-width="1"/>';
+
+  series.forEach(s => {
+    const color = colorOf(s.name);
+    const d = s.points.map((p, i) => (i === 0 ? 'M' : 'L') + x(p.t).toFixed(2) + ' ' + y(p.equity).toFixed(2)).join(' ');
+    svg += '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+    const last = s.points[s.points.length - 1];
+    svg += '<circle cx="' + x(last.t).toFixed(2) + '" cy="' + y(last.equity).toFixed(2) + '" r="4" fill="' + color + '" stroke="var(--surface)" stroke-width="2"/>';
+    svg += '<text x="' + (x(last.t) + 8).toFixed(2) + '" y="' + (y(last.equity) + 4).toFixed(2) + '" font-size="11" font-weight="600" fill="' + color + '">' + moneyFmt.format(last.equity).replace('.00', '') + '</text>';
+  });
+
+  svg += '<rect id="equityHit" x="' + padL + '" y="' + padT + '" width="' + (W - padL - padR) + '" height="' + (H - padT - padB) + '" fill="transparent"/>';
+  svg += '<line id="equityCrosshair" class="crosshair" x1="0" x2="0" y1="' + padT + '" y2="' + (H - padB) + '" style="display:none"/>';
+  svg += '</svg>';
+
+  const legend = names.length > 1
+    ? '<div class="chart-legend">' + names.map(n => '<span class="item"><span class="swatch" style="background:' + colorOf(n) + '"></span>' + esc(n) + '</span>').join('') + '</div>'
+    : '';
+
+  const tableRows = series[0].points.map((_, i) => {
+    const cells = series.map(s => s.points[i] ? money(s.points[i].equity) : '—').join('</td><td class="num mono">');
+    const t = series.find(s => s.points[i])?.points[i]?.t;
+    return '<tr><td>' + (t ? dateShort(new Date(t).toISOString()) : '—') + '</td><td class="num mono">' + cells + '</td></tr>';
+  }).join('');
+
+  wrap.innerHTML = '<div class="chart-wrap">' + svg + '</div>' + legend
+    + '<details class="tv"><summary>View as table (' + series[0].points.length + ' points)</summary>'
+    + '<div class="table-scroll" style="margin-top:8px"><table><thead><tr><th>Time</th>' + names.map(n => '<th class="num">' + esc(n) + '</th>').join('') + '</tr></thead>'
+    + '<tbody>' + tableRows + '</tbody></table></div></details>';
+
+  wireEquityHover(series, x, y, tMin, tMax);
+}
+
+function wireEquityHover(series, x, y, tMin, tMax) {
+  const hit = document.getElementById('equityHit');
+  const crosshair = document.getElementById('equityCrosshair');
+  const tooltip = document.getElementById('tooltip');
+  const svg = hit.closest('svg');
+  if (!hit) return;
+
+  hit.addEventListener('pointermove', e => {
+    const rect = svg.getBoundingClientRect();
+    const vb = svg.viewBox.baseVal;
+    const px = ((e.clientX - rect.left) / rect.width) * vb.width;
+    const t = tMin + ((px - x(tMin) + x(tMin)) / (x(tMax) - x(tMin))) * (tMax - tMin);
+
+    // snap to nearest sample across all series
+    let nearest = null, nearestDist = Infinity;
+    series.forEach(s => s.points.forEach(p => {
+      const dist = Math.abs(p.t - t);
+      if (dist < nearestDist) { nearestDist = dist; nearest = p.t; }
+    }));
+    if (nearest == null) return;
+
+    crosshair.setAttribute('x1', x(nearest)); crosshair.setAttribute('x2', x(nearest));
+    crosshair.style.display = '';
+
+    let rows = '';
+    series.forEach(s => {
+      const p = s.points.reduce((best, cur) => (best == null || Math.abs(cur.t - nearest) < Math.abs(best.t - nearest)) ? cur : best, null);
+      if (!p) return;
+      rows += '<div class="row"><span class="key" style="background:' + colorOf(s.name) + '"></span><span class="nm">' + esc(s.name) + '</span><span class="val">' + money(p.equity) + '</span></div>';
+    });
+    tooltip.innerHTML = '<div class="t-time">' + esc(dateShort(new Date(nearest).toISOString())) + '</div>' + rows;
+    tooltip.style.display = 'block';
+    const wrapRect = hit.closest('.chart-wrap').getBoundingClientRect();
+    let left = e.clientX - wrapRect.left + 14;
+    if (left + 180 > wrapRect.width) left = e.clientX - wrapRect.left - 194;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = (e.clientY - wrapRect.top - 10) + 'px';
+  });
+  hit.addEventListener('pointerleave', () => {
+    crosshair.style.display = 'none';
+    tooltip.style.display = 'none';
+  });
+}
+
+/* ---------------------------------------------------------------------
+   Live prices
+--------------------------------------------------------------------- */
+function renderTickers(quotes) {
+  const wrap = document.getElementById('tickersWrap');
+  if (!quotes.length) { wrap.innerHTML = '<p class="empty">Waiting for first prices…</p>'; return; }
+  wrap.innerHTML = '<div class="tickers">' + quotes.map(q => {
+    if (!q.ok) {
+      return '<div class="ticker"><div class="sym">' + esc(q.instrument) + '</div><div class="px flat">—</div></div>';
+    }
+    const price = parseFloat(q.price);
+    if (state.firstPrice[q.instrument] === undefined) state.firstPrice[q.instrument] = price;
+    const base = state.firstPrice[q.instrument];
+    const chg = base > 0 ? ((price - base) / base) * 100 : 0;
+    return '<div class="ticker">'
+      + '<div class="sym">' + esc(q.instrument) + '</div>'
+      + '<div class="px">' + money(q.price) + '</div>'
+      + '<div class="dchg ' + deltaClass(chg) + '">' + pct(chg) + ' since load</div>'
+      + '</div>';
+  }).join('') + '</div>';
+}
+
+/* ---------------------------------------------------------------------
+   Recent trades — merged across every strategy, newest first, each row
+   carries the same identity color as its strategy in the scoreboard and
+   the equity chart.
+--------------------------------------------------------------------- */
+function renderTrades(fillsByStrategy) {
+  const wrap = document.getElementById('tradesWrap');
+  const all = [];
+  Object.entries(fillsByStrategy).forEach(([name, fills]) => {
+    (fills || []).forEach(f => all.push(Object.assign({ strategy: name }, f)));
+  });
+  if (!all.length) { wrap.innerHTML = '<p class="empty">No trades yet.</p>'; return; }
+  all.sort((a, b) => new Date(b.time) - new Date(a.time));
+
+  const rows = all.slice(0, 40).map(f => {
+    const pl = parseFloat(f.realized_pl) || 0;
+    const plCell = f.side === 'sell' ? '<td class="num mono ' + deltaClass(pl) + '">' + money(f.realized_pl) + '</td>' : '<td class="num mono flat">—</td>';
+    return '<tr>'
+      + '<td class="mono">' + esc(timeShort(f.time)) + '</td>'
+      + '<td class="name-cell"><span class="dot" style="background:' + colorOf(f.strategy) + '"></span>' + esc(f.strategy) + '</td>'
+      + '<td>' + esc(f.instrument) + '</td>'
+      + '<td><span class="badge ' + (f.side === 'buy' ? 'buy' : 'sell') + '">' + esc((f.side || '').toUpperCase()) + '</span></td>'
+      + '<td class="num mono">' + money(f.price) + '</td>'
+      + '<td class="num mono">' + (parseFloat(f.quantity) || 0).toFixed(6) + '</td>'
+      + plCell
+      + '<td class="reason">' + esc(f.reason) + '</td>'
+      + '</tr>';
+  }).join('');
+
+  wrap.innerHTML = '<table><thead><tr><th>Time</th><th>Strategy</th><th>Instrument</th><th>Side</th>'
+    + '<th class="num">Price</th><th class="num">Qty</th><th class="num">Realized P&amp;L</th><th>Reason</th></tr></thead>'
+    + '<tbody>' + rows + '</tbody></table>';
+}
+
+/* ---------------------------------------------------------------------
+   Pipeline health — per-subscriber backpressure meters. Severity:
+   critical if the publisher is ever blocked on this subscriber (that
+   means backpressure reached ingest, which — per this project's own
+   design — should never happen against a live exchange feed), warning
+   if it has ever dropped, otherwise normal.
+--------------------------------------------------------------------- */
+function renderMeters(metrics) {
+  const wrap = document.getElementById('metersWrap');
+  const subs = (metrics && metrics.subscribers) || [];
+  if (!subs.length) { wrap.innerHTML = '<p class="empty">No subscribers reporting yet.</p>'; return; }
+
+  const meters = subs.map(s => {
+    const pct = s.capacity > 0 ? Math.min(100, (s.depth / s.capacity) * 100) : 0;
+    const sev = s.blocked_nanos > 0 ? 'crit' : s.dropped > 0 ? 'warn' : 'ok';
+    const badge = sev === 'crit' ? '<span class="badge crit">BLOCKED</span>' : sev === 'warn' ? '<span class="badge warn">DROPPING</span>' : '<span class="badge ok">OK</span>';
+    return '<div class="meter">'
+      + '<div class="mhead"><span class="nm">' + esc(s.name) + '</span>' + badge + '</div>'
+      + '<div class="track"><div class="fill ' + sev + '" style="width:' + pct.toFixed(1) + '%"></div></div>'
+      + '<div class="mfoot"><span>' + esc(s.policy) + ' · depth ' + num(s.depth) + '/' + num(s.capacity) + '</span>'
+      + '<span>dropped ' + num(s.dropped) + '</span></div>'
+      + '</div>';
+  }).join('');
+
+  let extra = '';
+  if (metrics.persist) {
+    const p = metrics.persist;
+    extra = '<div class="meter"><div class="mhead"><span class="nm">persist (disk)</span>'
+      + (p.errors > 0 ? '<span class="badge crit">ERRORS</span>' : '<span class="badge ok">OK</span>') + '</div>'
+      + '<div class="mfoot"><span>received ' + num(p.received) + '</span><span>stored ' + num(p.stored) + '</span></div>'
+      + '<div class="mfoot"><span>duplicate ' + num(p.duplicate) + '</span><span>errors ' + num(p.errors) + '</span></div></div>';
+  }
+
+  wrap.innerHTML = '<div class="meters">' + meters + extra + '</div>';
+}
+
+/* ---------------------------------------------------------------------
+   Archive
+--------------------------------------------------------------------- */
+function renderArchive(metrics, instruments) {
+  const wrap = document.getElementById('archiveWrap');
+  const a = metrics && metrics.archive;
+  const rows = (instruments || []).map(s =>
+    '<tr><td>' + esc(s.venue) + '</td><td>' + esc(s.instrument) + '</td>'
+    + '<td class="num mono">' + num(s.ticks) + '</td>'
+    + '<td class="mono">' + esc(dateShort(s.first_event_time)) + '</td>'
+    + '<td class="mono">' + esc(dateShort(s.last_event_time)) + '</td></tr>'
+  ).join('');
+
+  const tiles = a ? (
+    '<div class="tiles" style="margin-bottom:12px">'
+    + tile('Size on disk', fmtBytes(a.bytes))
+    + tile('Normalized ticks', num(a.ticks))
+    + tile('Raw frames', num(a.raw_frames))
+    + '</div>'
+  ) : '';
+
+  wrap.innerHTML = tiles + (rows
+    ? '<div class="table-scroll"><table><thead><tr><th>Venue</th><th>Instrument</th><th class="num">Ticks</th><th>First</th><th>Last</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+    : '<p class="empty">No ticks stored yet.</p>');
+}
+
+/* ---------------------------------------------------------------------
+   Poll loop. Two cadences: the fast one (scoreboard, prices, health)
+   every 5s for a live feel; the slow one (equity history) every 60s,
+   fetched incrementally via ?since=<last known point> so a month-long
+   run never re-downloads its own multi-week history on every tick —
+   only new points since the last successful fetch cross the wire.
+--------------------------------------------------------------------- */
+async function fastPoll() {
+  try {
+    const [health, metrics, instruments, paper] = await Promise.all([
+      getJSON('/healthz'),
+      getJSON('/metrics'),
+      getJSON('/v1/instruments'),
+      getJSON('/v1/paper'),
+    ]);
+
+    const paperList = (paper && paper.strategies) || [];
+    if (paperList.length) assignColors(paperList.map(s => s.name));
+
+    state.instruments = (instruments && instruments.configured) || [];
+
+    const quotes = await Promise.all(state.instruments.map(async id => {
+      const q = await getJSON('/v1/quote/' + encodeURIComponent(id));
+      return q ? Object.assign({ ok: true }, q) : { ok: false, instrument: id };
+    }));
+
+    const fillsByStrategy = {};
+    await Promise.all(paperList.map(async s => {
+      const f = await getJSON('/v1/paper/' + encodeURIComponent(s.name) + '/fills?limit=15');
+      fillsByStrategy[s.name] = f ? f.fills : [];
+    }));
+
+    renderOverview(health, metrics, paperList);
+    renderScoreboard(paperList);
+    renderTickers(quotes);
+    renderTrades(fillsByStrategy);
+    renderMeters(metrics);
+    renderArchive(metrics, instruments && instruments.stored);
+    if (paperList.length) renderEquityChart(paperList.map(s => s.name));
+
+    state.lastOK = Date.now();
+    updateFreshness();
+  } catch (err) {
+    console.error('poll failed', err);
+    updateFreshness();
+  }
+}
+
+async function slowPoll() {
+  const paper = await getJSON('/v1/paper');
+  const paperList = (paper && paper.strategies) || [];
+  await Promise.all(paperList.map(async s => {
+    const since = state.equityLastPoint[s.name];
+    const url = '/v1/paper/' + encodeURIComponent(s.name) + '/history'
+      + (since ? '?since=' + encodeURIComponent(since) : '');
+    const hist = await getJSON(url);
+    if (!hist || !hist.points || !hist.points.length) return;
+
+    const merged = new Map((state.equity[s.name] || []).map(p => [p.iso, p]));
+    hist.points.forEach(p => merged.set(p.time, { t: new Date(p.time).getTime(), iso: p.time, equity: parseFloat(p.equity) || 0 }));
+    const arr = [...merged.values()].sort((a, b) => a.t - b.t);
+    state.equity[s.name] = arr;
+    state.equityLastPoint[s.name] = arr[arr.length - 1].iso;
+  }));
+  if (paperList.length) renderEquityChart(paperList.map(s => s.name));
+}
+
+function updateFreshness() {
+  const badge = document.getElementById('staleBadge');
+  const updated = document.getElementById('updated');
+  const ageSec = state.lastOK ? (Date.now() - state.lastOK) / 1000 : Infinity;
+  badge.classList.toggle('show', ageSec > 20);
+  updated.textContent = state.lastOK ? 'updated ' + relTime(new Date(state.lastOK).toISOString()) : 'connecting…';
+}
+
+fastPoll();
+slowPoll();
+setInterval(fastPoll, 5000);
+setInterval(slowPoll, 60000);
+setInterval(updateFreshness, 5000);
+</script>
+</body>
+</html>

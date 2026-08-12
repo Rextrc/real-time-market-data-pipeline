@@ -386,3 +386,113 @@ func TestPruneToSizeNoopWhenUnderCap(t *testing.T) {
 		t.Errorf("deleted %d rows while under the cap, want 0", deleted)
 	}
 }
+
+func TestEquityHistoryRoundTripAndOrder(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	snaps := []store.EquitySnapshot{
+		{Strategy: "momentum", Time: base, Equity: model.Decimal{Unscaled: 1000000, Scale: 2}, Trades: 0},
+		{Strategy: "momentum", Time: base.Add(5 * time.Minute), Equity: model.Decimal{Unscaled: 1001500, Scale: 2}, Trades: 1},
+		{Strategy: "momentum", Time: base.Add(10 * time.Minute), Equity: model.Decimal{Unscaled: 999800, Scale: 2}, Trades: 2},
+		// A second strategy's points must not leak into the first's history.
+		{Strategy: "meanrev", Time: base.Add(5 * time.Minute), Equity: model.Decimal{Unscaled: 1002000, Scale: 2}, Trades: 1},
+	}
+	for _, s := range snaps {
+		if err := db.RecordEquity(ctx, s); err != nil {
+			t.Fatalf("RecordEquity: %v", err)
+		}
+	}
+
+	got, err := db.EquityHistory(ctx, "momentum", time.Time{}, 0)
+	if err != nil {
+		t.Fatalf("EquityHistory: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d points, want 3 (meanrev's point must not appear)", len(got))
+	}
+	for i, want := range []string{"10000.00", "10015.00", "9998.00"} {
+		if got[i].Equity.String() != want {
+			t.Errorf("point %d equity = %s, want %s", i, got[i].Equity, want)
+		}
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i].Time.Before(got[i-1].Time) {
+			t.Error("results are not in ascending time order")
+		}
+	}
+}
+
+// TestEquityHistoryIsIdempotent matters because the engine records a
+// snapshot both at startup and (independently) on its own ticker — a
+// restart landing close to a scheduled tick must not double-write the same
+// moment and put a spike in the chart.
+func TestEquityHistoryIsIdempotent(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	snap := store.EquitySnapshot{
+		Strategy: "momentum", Time: time.Unix(1710000000, 0).UTC(),
+		Equity: model.Decimal{Unscaled: 1000000, Scale: 2},
+	}
+	if err := db.RecordEquity(ctx, snap); err != nil {
+		t.Fatal(err)
+	}
+	// Re-record the same instant with a different value — the second write
+	// must be a no-op, not an overwrite: a snapshot is a historical fact
+	// about that moment, not a mutable cell.
+	snap.Equity = model.Decimal{Unscaled: 500000, Scale: 2}
+	if err := db.RecordEquity(ctx, snap); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.EquityHistory(ctx, "momentum", time.Time{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d points, want 1", len(got))
+	}
+	if got[0].Equity.String() != "10000.00" {
+		t.Errorf("equity = %s, want the first write's 10000.00 to have survived", got[0].Equity)
+	}
+}
+
+func TestEquityHistorySinceFilter(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		s := store.EquitySnapshot{
+			Strategy: "momentum", Time: base.Add(time.Duration(i) * time.Minute),
+			Equity: model.Decimal{Unscaled: int64(1000000 + i), Scale: 2},
+		}
+		if err := db.RecordEquity(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// This is the incremental-fetch path the dashboard actually uses: ask
+	// for everything from the last point it already has, expecting to get
+	// back only what's new.
+	got, err := db.EquityHistory(ctx, "momentum", base.Add(3*time.Minute), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d points since minute 3, want 2 (minutes 3 and 4)", len(got))
+	}
+}
+
+func TestEquityHistoryUnknownStrategyIsEmpty(t *testing.T) {
+	db := open(t)
+	got, err := db.EquityHistory(context.Background(), "nonexistent", time.Time{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d points for an unrecorded strategy, want 0", len(got))
+	}
+}

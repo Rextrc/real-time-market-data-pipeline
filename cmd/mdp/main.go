@@ -65,16 +65,17 @@ type config struct {
 	logLevel     string
 	pingInterval time.Duration
 
-	paperEnabled bool
-	paperCash    float64
-	feeRate      float64
-	slippage     float64
-	maxPosition  float64
-	strategyName string
-	evalEvery    time.Duration
-	fillLatency  time.Duration
-	paperState   string
-	llmModel     string
+	paperEnabled    bool
+	paperCash       float64
+	feeRate         float64
+	slippage        float64
+	maxPosition     float64
+	strategyName    string
+	evalEvery       time.Duration
+	fillLatency     time.Duration
+	paperState      string
+	llmModel        string
+	historyInterval time.Duration
 
 	retainTicks   time.Duration
 	retainRaw     time.Duration
@@ -170,6 +171,7 @@ func run() error {
 	flag.Float64Var(&c.maxPosition, "paper-max-position", envFloat("MDP_PAPER_MAX_POSITION", 0.25), "max fraction of equity per position")
 	flag.StringVar(&c.strategyName, "strategy", env("MDP_STRATEGY", "momentum"), "comma-separated: momentum, meanrev, llm, llm+momentum — each runs its own independent account")
 	flag.DurationVar(&c.evalEvery, "eval-interval", envDur("MDP_EVAL_INTERVAL", 60*time.Second), "how often each strategy runs")
+	flag.DurationVar(&c.historyInterval, "history-interval", envDur("MDP_HISTORY_INTERVAL", 5*time.Minute), "how often an equity snapshot is recorded for the dashboard's equity curve")
 	flag.DurationVar(&c.fillLatency, "fill-latency", 500*time.Millisecond, "simulated execution delay")
 	flag.StringVar(&c.paperState, "paper-state", env("MDP_PAPER_STATE", "data/paper.json"), "path prefix for persisted paper books")
 	flag.StringVar(&c.llmModel, "llm-model", env("MDP_LLM_MODEL", ""), "override the Claude model ID")
@@ -309,6 +311,10 @@ func run() error {
 				EvalInterval: c.evalEvery,
 				FillLatency:  c.fillLatency,
 				StatePath:    statePathFor(c.paperState, name),
+				// Feeds the dashboard's equity curve. db already implements
+				// store.EquityRecorder — no extra wiring beyond passing it.
+				History:         db,
+				HistoryInterval: c.historyInterval,
 			}, acct, strat, builder, binance.ID, instruments, log.With("strategy", name))
 
 			sub, err := b.Subscribe(bus.SubscriberSpec{
@@ -364,7 +370,7 @@ func run() error {
 		g.Go(func() error { return ws.Run(ctx) })
 
 		api := httpapi.New(httpapi.Deps{
-			Store: db, Bus: b, Candles: builder, Paper: engines,
+			Store: db, Bus: b, Candles: builder, Paper: engines, History: db,
 			Persister: persister, Venue: binance.ID,
 			Instruments: instruments, StartedAt: startedAt, Log: log,
 		})

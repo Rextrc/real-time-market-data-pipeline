@@ -62,6 +62,19 @@ CREATE TABLE IF NOT EXISTS raw_frames (
 );
 CREATE INDEX IF NOT EXISTS raw_by_time ON raw_frames (venue, recv_ts_ns);
 CREATE INDEX IF NOT EXISTS raw_by_day ON raw_frames (day);
+
+CREATE TABLE IF NOT EXISTS equity_history (
+	strategy             TEXT    NOT NULL,
+	ts_ns                INTEGER NOT NULL,
+	equity_unscaled      INTEGER NOT NULL,
+	equity_scale         INTEGER NOT NULL,
+	realized_unscaled    INTEGER NOT NULL,
+	realized_scale       INTEGER NOT NULL,
+	unrealized_unscaled  INTEGER NOT NULL,
+	unrealized_scale     INTEGER NOT NULL,
+	trades               INTEGER NOT NULL,
+	PRIMARY KEY (strategy, ts_ns)
+);
 `
 
 // Durability selects the fsync policy. This is the dial from M3, named so
@@ -528,3 +541,84 @@ func (s *DB) Counts(ctx context.Context) (ticks, raw int64, err error) {
 
 // day is the partition key: the UTC date of the event.
 func day(t time.Time) string { return t.UTC().Format("2006-01-02") }
+
+// equityHistoryDefaultLimit and equityHistoryMaxLimit are sized for their
+// actual use case rather than reusing store.DefaultLimit/MaxLimit: at the
+// engine's default 5-minute sampling interval, a full month for one
+// strategy is ~8,640 points, so the default has to comfortably clear that
+// or a long-running chart silently truncates to its earliest data.
+const (
+	equityHistoryDefaultLimit = 20000
+	equityHistoryMaxLimit     = 100000
+)
+
+// RecordEquity stores one snapshot. Idempotent on (strategy, ts_ns) for the
+// same reason tick storage is: a duplicate write — a retried timer tick, a
+// clock that didn't advance between two samples — must be a no-op, not a
+// second row that skews the chart.
+func (s *DB) RecordEquity(ctx context.Context, snap store.EquitySnapshot) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO equity_history (
+			strategy, ts_ns, equity_unscaled, equity_scale,
+			realized_unscaled, realized_scale, unrealized_unscaled, unrealized_scale, trades
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (strategy, ts_ns) DO NOTHING`,
+		snap.Strategy, snap.Time.UnixNano(),
+		snap.Equity.Unscaled, int64(snap.Equity.Scale),
+		snap.RealizedPL.Unscaled, int64(snap.RealizedPL.Scale),
+		snap.UnrealizedPL.Unscaled, int64(snap.UnrealizedPL.Scale),
+		snap.Trades,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: record equity: %w", err)
+	}
+	return nil
+}
+
+// EquityHistory returns one strategy's snapshots, oldest first.
+func (s *DB) EquityHistory(ctx context.Context, strategy string, since time.Time, limit int) ([]store.EquitySnapshot, error) {
+	switch {
+	case limit <= 0:
+		limit = equityHistoryDefaultLimit
+	case limit > equityHistoryMaxLimit:
+		limit = equityHistoryMaxLimit
+	}
+
+	where := "WHERE strategy = ?"
+	args := []any{strategy}
+	if !since.IsZero() {
+		where += " AND ts_ns >= ?"
+		args = append(args, since.UnixNano())
+	}
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT ts_ns, equity_unscaled, equity_scale,
+			realized_unscaled, realized_scale, unrealized_unscaled, unrealized_scale, trades
+		FROM equity_history `+where+`
+		ORDER BY ts_ns ASC LIMIT ?`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: query equity history: %w", err)
+	}
+	defer rows.Close()
+
+	var out []store.EquitySnapshot
+	for rows.Next() {
+		var (
+			tsNS                                             int64
+			eqU, eqS, realU, realS, unrealU, unrealS, trades int64
+		)
+		if err := rows.Scan(&tsNS, &eqU, &eqS, &realU, &realS, &unrealU, &unrealS, &trades); err != nil {
+			return nil, fmt.Errorf("sqlite: scan equity history: %w", err)
+		}
+		out = append(out, store.EquitySnapshot{
+			Strategy:     strategy,
+			Time:         time.Unix(0, tsNS).UTC(),
+			Equity:       model.Decimal{Unscaled: eqU, Scale: uint8(eqS)},
+			RealizedPL:   model.Decimal{Unscaled: realU, Scale: uint8(realS)},
+			UnrealizedPL: model.Decimal{Unscaled: unrealU, Scale: uint8(unrealS)},
+			Trades:       int(trades),
+		})
+	}
+	return out, rows.Err()
+}

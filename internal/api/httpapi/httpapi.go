@@ -4,6 +4,7 @@ package httpapi
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -19,15 +20,28 @@ import (
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/store"
 )
 
+// dashboardHTML is the operator dashboard, embedded into the binary so
+// deploying the service is deploying the dashboard — no separate static
+// hosting, no build step, no asset pipeline. It's plain HTML/CSS/JS against
+// the JSON endpoints below; open internal/api/httpapi/static/dashboard.html
+// to edit it directly and rebuild.
+//
+//go:embed static/dashboard.html
+var dashboardHTML []byte
+
 // Deps is everything the API reads from. All optional except Store — the API
 // serves whatever is wired up and 404s the rest, so a partial deployment
 // still starts.
 type Deps struct {
-	Store       store.Reader
-	Bus         bus.Bus
-	Candles     *candles.Builder
-	Paper       []*paper.Engine
-	Persister   *persist.Persister
+	Store     store.Reader
+	Bus       bus.Bus
+	Candles   *candles.Builder
+	Paper     []*paper.Engine
+	Persister *persist.Persister
+	// History serves recorded equity snapshots for the dashboard's equity
+	// curve. Optional — a nil History just means that chart has nothing to
+	// draw, everything else still works.
+	History     store.EquityReader
 	Venue       model.VenueID
 	Instruments []model.InstrumentID
 	StartedAt   time.Time
@@ -46,6 +60,11 @@ func New(d Deps) *Server { return &Server{deps: d} }
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
+	// "/{$}" matches only the exact path "/" — not every unmatched subpath
+	// under it — so this can't accidentally swallow a typo'd API route and
+	// serve HTML where a client expected JSON.
+	mux.HandleFunc("GET /{$}", s.dashboard)
+
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("GET /v1/instruments", s.instruments)
@@ -55,8 +74,17 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/paper", s.paperAll)
 	mux.HandleFunc("GET /v1/paper/{strategy}", s.paperOne)
 	mux.HandleFunc("GET /v1/paper/{strategy}/fills", s.paperFills)
+	mux.HandleFunc("GET /v1/paper/{strategy}/history", s.paperHistory)
 
 	return logging(s.deps.Log, mux)
+}
+
+// dashboard serves the operator UI. No-store: a redeploy should never leave
+// a browser tab showing yesterday's dashboard behind a stale cache.
+func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write(dashboardHTML)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -260,6 +288,43 @@ func (s *Server) paperFills(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":  e.Name(),
 		"fills": e.Account().Fills(intParam(r, "limit", 100)),
+	})
+}
+
+// paperHistory serves the equity curve for one strategy. It checks the
+// strategy against the running engines (not just against whatever rows
+// happen to exist) so a typo'd name 404s the same way paperOne/paperFills
+// do, rather than returning an empty-but-200 result that looks like "this
+// strategy has no history yet."
+func (s *Server) paperHistory(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("strategy")
+	if s.engine(name) == nil {
+		writeError(w, http.StatusNotFound, errors.New("no such strategy"))
+		return
+	}
+	if s.deps.History == nil {
+		writeError(w, http.StatusNotFound, errors.New("equity history not enabled"))
+		return
+	}
+
+	var since time.Time
+	if v := r.URL.Query().Get("since"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("since must be RFC3339"))
+			return
+		}
+		since = t
+	}
+
+	points, err := s.deps.History.EquityHistory(r.Context(), name, since, intParam(r, "limit", 0))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":   name,
+		"points": points,
 	})
 }
 

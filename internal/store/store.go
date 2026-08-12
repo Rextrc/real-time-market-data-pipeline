@@ -88,6 +88,32 @@ type Store interface {
 	Reader
 }
 
+// EquitySnapshot is one point-in-time reading of a paper trading account,
+// recorded periodically so the dashboard can draw an equity curve instead of
+// only ever showing the current number. Cheap to keep: even a month of
+// 5-minute samples across several strategies is a few hundred KB.
+type EquitySnapshot struct {
+	Strategy     string        `json:"strategy"`
+	Time         time.Time     `json:"time"`
+	Equity       model.Decimal `json:"equity"`
+	RealizedPL   model.Decimal `json:"realized_pl"`
+	UnrealizedPL model.Decimal `json:"unrealized_pl"`
+	Trades       int           `json:"trades"`
+}
+
+// EquityRecorder persists periodic account snapshots. Implemented by the
+// store; consumed by the paper engine, which owns the schedule.
+type EquityRecorder interface {
+	RecordEquity(ctx context.Context, s EquitySnapshot) error
+}
+
+// EquityReader serves recorded snapshots back for charting.
+type EquityReader interface {
+	// EquityHistory returns snapshots for one strategy, oldest first. A zero
+	// since means "from the beginning".
+	EquityHistory(ctx context.Context, strategy string, since time.Time, limit int) ([]EquitySnapshot, error)
+}
+
 // DefaultLimit caps an unbounded query so a missing limit cannot pull the
 // entire archive into memory.
 const DefaultLimit = 1000

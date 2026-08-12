@@ -44,6 +44,7 @@ rebuilds do not take your captured history with them.
 
 | Endpoint | What it gives you |
 |---|---|
+| `GET /` | dashboard — scoreboard, equity curves, live prices, trade log, pipeline health |
 | `GET /healthz` | liveness |
 | `GET /metrics` | queue depths, drops, lag, persister counters, paper P&L |
 | `GET /v1/instruments` | configured instruments + what the archive holds |
@@ -53,7 +54,16 @@ rebuilds do not take your captured history with them.
 | `GET /v1/paper` | scoreboard: every strategy side by side |
 | `GET /v1/paper/{strategy}` | one account: equity, P&L, drawdown, positions |
 | `GET /v1/paper/{strategy}/fills?limit=100` | trade log, each with the reason it fired |
+| `GET /v1/paper/{strategy}/history?since=&limit=` | equity snapshots over time, for charting |
 | `WS /v1/stream?instruments=BTC-USDT` | live ticks |
+
+**Dashboard.** Visit the server's root URL in a browser (locally: `http://localhost:8080/`,
+on Railway: your deployed URL) and you get a live view of the bot — no separate
+frontend, no build step, it's a single HTML page embedded in the Go binary via
+`go:embed`. It polls the API every 5s (prices, health, scoreboard) and every 60s
+(equity history) and works in light or dark mode. Equity snapshots are recorded
+every `-history-interval` (default 5m, env `MDP_HISTORY_INTERVAL`) — shorten it
+if you want the chart to fill in faster on a short test run.
 
 ```sh
 curl localhost:8080/v1/paper | jq .
