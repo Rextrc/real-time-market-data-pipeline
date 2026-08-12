@@ -28,10 +28,17 @@ RUN apk add --no-cache ca-certificates tzdata && \
 COPY --from=build /out/mdp /usr/local/bin/mdp
 COPY --from=build /out/fakevenue /usr/local/bin/fakevenue
 
-# The archive is the one irreplaceable asset here, so it lives on a volume.
-# A container restart must never be able to take the captured history with it.
+# The archive is the one irreplaceable asset here, so it must live on a
+# persistent volume — a container restart must never be able to take the
+# captured history with it. This just creates the mount point; the volume
+# itself is attached through the platform (docker-compose.yml's `volumes:`
+# for Compose, or a Railway Volume mounted at /data in the dashboard).
+# Deliberately no Docker `VOLUME` instruction here: Railway's builder
+# rejects it outright ("use Railway Volumes"), and even where it's
+# accepted, VOLUME silently creates an anonymous local volume if the
+# platform-level mount is ever missing — masking exactly the
+# misconfiguration this comment warns about instead of surfacing it.
 RUN mkdir -p /data && chown mdp:mdp /data
-VOLUME ["/data"]
 
 USER mdp
 WORKDIR /data
