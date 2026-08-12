@@ -169,7 +169,7 @@ func run() error {
 	flag.Float64Var(&c.feeRate, "paper-fee", envFloat("MDP_PAPER_FEE", 0.001), "fee per fill as a fraction of notional")
 	flag.Float64Var(&c.slippage, "paper-slippage", envFloat("MDP_PAPER_SLIPPAGE", 0.0005), "spread crossed per fill")
 	flag.Float64Var(&c.maxPosition, "paper-max-position", envFloat("MDP_PAPER_MAX_POSITION", 0.25), "max fraction of equity per position")
-	flag.StringVar(&c.strategyName, "strategy", env("MDP_STRATEGY", "momentum"), "comma-separated: momentum, meanrev, llm, llm+momentum — each runs its own independent account")
+	flag.StringVar(&c.strategyName, "strategy", env("MDP_STRATEGY", "adaptive"), "comma-separated: adaptive, momentum, meanrev, llm, llm+momentum — each runs its own independent account")
 	flag.DurationVar(&c.evalEvery, "eval-interval", envDur("MDP_EVAL_INTERVAL", 60*time.Second), "how often each strategy runs")
 	flag.DurationVar(&c.historyInterval, "history-interval", envDur("MDP_HISTORY_INTERVAL", 5*time.Minute), "how often an equity snapshot is recorded for the dashboard's equity curve")
 	flag.DurationVar(&c.fillLatency, "fill-latency", 500*time.Millisecond, "simulated execution delay")
@@ -182,11 +182,11 @@ func run() error {
 	flag.BoolVar(&c.vacuumOnStart, "vacuum-on-start", envBool("MDP_VACUUM_ON_START", false), "rebuild the database at startup so pruning can reclaim space (slow on a large archive)")
 
 	flag.BoolVar(&c.alpacaEnabled, "alpaca", envBool("MDP_ALPACA", false), "execute one strategy's signals as real orders against Alpaca's PAPER trading API")
-	flag.StringVar(&c.alpacaStrategy, "alpaca-strategy", env("MDP_ALPACA_STRATEGY", "momentum"), "which -strategy this engine drives (must be one already listed there)")
+	flag.StringVar(&c.alpacaStrategy, "alpaca-strategy", env("MDP_ALPACA_STRATEGY", "adaptive"), "which -strategy this engine drives (must be one already listed there)")
 	flag.StringVar(&c.alpacaBaseURL, "alpaca-base-url", env("MDP_ALPACA_BASE_URL", alpaca.PaperBaseURL), "Alpaca API base URL; changing this away from the paper endpoint also requires -alpaca-allow-live")
 	flag.BoolVar(&c.alpacaAllowLive, "alpaca-allow-live", envBool("MDP_ALPACA_ALLOW_LIVE", false), "required in addition to a non-paper -alpaca-base-url before any real-money order can be sent")
 	flag.Float64Var(&c.alpacaMaxPosition, "alpaca-max-position", envFloat("MDP_ALPACA_MAX_POSITION", 0.1), "max fraction of account equity per Alpaca position")
-	flag.DurationVar(&c.alpacaEvalEvery, "alpaca-eval-interval", envDur("MDP_ALPACA_EVAL_INTERVAL", 5*time.Minute), "how often the Alpaca engine evaluates and can trade")
+	flag.DurationVar(&c.alpacaEvalEvery, "alpaca-eval-interval", envDur("MDP_ALPACA_EVAL_INTERVAL", 2*time.Minute), "how often the Alpaca engine evaluates and can trade")
 	flag.Parse()
 
 	log := newLogger(c.logLevel)
@@ -573,7 +573,10 @@ func buildStrategy(name string, c config, log *slog.Logger) (strategy.Strategy, 
 	momentum := strategy.NewMomentum(9, 27)
 
 	switch name {
-	case "", "momentum":
+	case "", "adaptive":
+		return strategy.NewAdaptive(nil, 0, 0), nil
+
+	case "momentum":
 		return momentum, nil
 
 	case "meanrev":
@@ -595,7 +598,7 @@ func buildStrategy(name string, c config, log *slog.Logger) (strategy.Strategy, 
 		}, log), nil
 
 	default:
-		return nil, fmt.Errorf("unknown strategy %q (want momentum, meanrev, llm, or llm+momentum)", name)
+		return nil, fmt.Errorf("unknown strategy %q (want adaptive, momentum, meanrev, llm, or llm+momentum)", name)
 	}
 }
 

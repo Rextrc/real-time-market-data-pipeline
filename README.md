@@ -80,12 +80,12 @@ arriving mid-scan would make an offset skip or repeat records.
 Simulated only. No exchange credentials, no orders, no way to lose money.
 
 ```sh
-go run ./cmd/mdp -paper -strategy momentum
+go run ./cmd/mdp -paper -strategy adaptive
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-strategy` | `momentum` | comma-separated: `momentum`, `meanrev`, `llm`, `llm+momentum` — each gets its own independent account on identical data |
+| `-strategy` | `adaptive` | comma-separated: `adaptive`, `momentum`, `meanrev`, `llm`, `llm+momentum` — each gets its own independent account on identical data |
 | `-paper-cash` | `10000` | starting balance |
 | `-paper-fee` | `0.001` | fee per fill (10bps, ≈ Binance spot taker) |
 | `-paper-slippage` | `0.0005` | spread crossed per fill |
@@ -106,6 +106,22 @@ depth, partial fills, rejects, exchange downtime, and funding. Treat paper
 P&L as an optimistic bound, not a forecast.
 
 ### Strategies
+
+**`adaptive`** (default) — a bandit over five SMA-crossover configurations
+(2/6, 3/9, 5/15, 8/21, 13/34), fast to slow. On every evaluation it looks at
+whichever of those "arms" is currently signaling a buy and picks one:
+mostly the arm with the best realized return so far (an EWMA over that arm's
+own closed trades), occasionally (15% of the time) a random eligible arm
+instead, so one that's gone quiet still gets re-tested rather than written
+off forever. Each position is closed only by the same arm that opened it, so
+a trade's outcome is always credited to the rule that actually made the
+call. The short arms are what make it trade many times a day instead of a
+few times a week — that's also what makes it noisier and more fee-sensitive
+than `momentum`. Read this as "chases whatever has recently been working,"
+not as a forecaster: a streak of luck looks identical to real edge over a
+handful of trades, and it adapts to a regime only after the regime has
+already happened. It's a more active baseline to compare against, not a
+strategy to trust because it says "adaptive."
 
 **`momentum`** — a 9/27 SMA crossover. It is a baseline, not an edge:
 crossover systems are the most-published trading rule in existence, which is
@@ -152,21 +168,22 @@ a replacement for it, and it needs Alpaca API keys.
 ```sh
 export ALPACA_API_KEY=...
 export ALPACA_API_SECRET=...
-go run ./cmd/mdp -paper -strategy momentum,meanrev \
-  -alpaca -alpaca-strategy momentum -alpaca-eval-interval 5m
+go run ./cmd/mdp -paper -strategy adaptive,momentum,meanrev \
+  -alpaca -alpaca-strategy adaptive -alpaca-eval-interval 2m
 ```
 
-`-alpaca-strategy` names one of the strategies already listed in `-strategy`
-and gives it a second, real execution path alongside its simulated one — so
-you can watch the same decisions play out in both an in-process book and a
-real Alpaca account, side by side.
+`-alpaca-strategy` builds a second, independent instance of one of the
+strategies named in `buildStrategy` (same set as `-strategy`) and gives it a
+real execution path — so you can watch the same kind of decisions play out in
+both an in-process book and a real Alpaca account, side by side. It doesn't
+have to also appear in `-strategy`; it's fine to run it live-only.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `-alpaca` | off | enable real order execution |
-| `-alpaca-strategy` | `momentum` | which strategy drives it |
+| `-alpaca-strategy` | `adaptive` | which strategy drives it |
 | `-alpaca-max-position` | `0.1` | max fraction of Alpaca account equity per order — enforced here, independent of the strategy and of whatever Alpaca itself would allow |
-| `-alpaca-eval-interval` | `5m` | how often it can trade; also the ceiling on order frequency |
+| `-alpaca-eval-interval` | `2m` | how often it can trade; also the ceiling on order frequency |
 | `-alpaca-base-url` | Alpaca's paper endpoint | see below |
 | `-alpaca-allow-live` | off | see below |
 
