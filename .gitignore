@@ -1,0 +1,4 @@
+/mdp
+*.db
+*.db-wal
+*.db-shm

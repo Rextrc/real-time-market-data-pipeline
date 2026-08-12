@@ -175,7 +175,7 @@ cmd/
 internal/
   model/               # Tick, InstrumentID, VenueID, Seq. Imports NOTHING.
   venue/
-    venue.go           # interface: Stream(ctx, []InstrumentID) (<-chan RawMessage, error)
+    venue.go           # interface: Stream(ctx, []InstrumentID, chan<- RawMessage) error
     binance/
     coinbase/
     synthetic/         # load generator: N ticks/sec on demand
@@ -217,6 +217,12 @@ directory layout itself):
    you've silently made your internal type a public API you can't change.
 5. **The bus knows nothing about consumers; consumers know nothing about venues.**
    The only shared vocabulary is `model.Tick`.
+   A note on `Venue.Stream`: it takes the output channel and blocks, rather
+   than returning a channel. A method that owns no goroutines composes
+   directly with `errgroup`, has exactly one way to report failure, and
+   cannot leak a reader across a reconnect — which is the specific bug M6
+   goes looking for.
+
 6. **Time is a dependency.** `type Clock interface { Now() time.Time }`, injected.
    You will need this for deterministic tests and for replay, and retrofitting it
    means touching everything.
