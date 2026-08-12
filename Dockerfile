@@ -22,8 +22,7 @@ FROM alpine:3.20
 # Certificates for the TLS handshake with the exchange, and tzdata because
 # every timestamp in this system is UTC and should stay that way even if the
 # host disagrees.
-RUN apk add --no-cache ca-certificates tzdata && \
-    adduser -D -u 10001 mdp
+RUN apk add --no-cache ca-certificates tzdata
 
 COPY --from=build /out/mdp /usr/local/bin/mdp
 COPY --from=build /out/fakevenue /usr/local/bin/fakevenue
@@ -38,9 +37,17 @@ COPY --from=build /out/fakevenue /usr/local/bin/fakevenue
 # accepted, VOLUME silently creates an anonymous local volume if the
 # platform-level mount is ever missing — masking exactly the
 # misconfiguration this comment warns about instead of surfacing it.
-RUN mkdir -p /data && chown mdp:mdp /data
+RUN mkdir -p /data
 
-USER mdp
+# Deliberately running as root rather than a dedicated user. A freshly
+# attached platform volume (a Railway Volume, a Compose named volume) is
+# typically created root-owned, and a non-root process then gets a silent
+# permission-denied writing its first database file inside it — the
+# process exits before ever binding the HTTP listener, which shows up
+# downstream as nothing more informative than a failed health check. There
+# is no multi-tenant isolation need in this container (nothing else runs
+# in it, no untrusted code executes inside it), so the sandboxing a
+# dedicated user would buy isn't worth that fragility.
 WORKDIR /data
 EXPOSE 8080
 
