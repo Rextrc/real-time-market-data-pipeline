@@ -164,7 +164,26 @@ matter what you type — raise it once you trust the parsing, not before.
 
 ---
 
-## 6. Deploy straight to Railway
+## 6. (Optional) Trade a basket of stocks automatically
+
+No texting required — this evaluates and trades a list of stocks on its own,
+continuously.
+
+```sh
+export ALPACA_API_KEY=...
+export ALPACA_API_SECRET=...
+go run ./cmd/mdp -equity-auto
+```
+
+Defaults to ten liquid large-caps and trades whenever its bandit strategy
+sees a crossover — how often that actually happens depends on real price
+movement, not a fixed schedule. Watch for `"equity fill"` in the log. See
+the README's *Automatic stock trading* section before raising
+`-equity-max-position` or pointing it anywhere but the paper endpoint.
+
+---
+
+## 7. Deploy straight to Railway
 
 No local Go, no terminal commands on your machine at all — Railway builds
 the repo's Dockerfile and runs it. This is the "upload it and it's running"
@@ -221,6 +240,8 @@ Optional additions to the same variable block:
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` (plus the same `ALPACA_API_KEY` /
   `ALPACA_API_SECRET` above) for the Telegram bot from step 5 — also add
   `MDP_TELEGRAM=true`.
+- The same `ALPACA_API_KEY` / `ALPACA_API_SECRET` again plus
+  `MDP_EQUITY_AUTO=true` for the automatic stock basket from step 6.
 
 **Step 5 — save.** Railway redeploys automatically whenever you change a
 variable or push to the branch. Watch the **Deployments** tab; once it says

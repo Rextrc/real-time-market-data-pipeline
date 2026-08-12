@@ -281,6 +281,50 @@ the entry filling and the target being hit.
 
 ---
 
+## Automatic stock trading
+
+The automated strategies elsewhere in this README (`-strategy`, `-alpaca`)
+trade the crypto pairs the Binance pipeline feeds them. This is the same
+idea for a basket of stocks — no manual "buy" texts, it evaluates and trades
+on its own, continuously, across several symbols at once.
+
+```sh
+export ALPACA_API_KEY=...
+export ALPACA_API_SECRET=...
+go run ./cmd/mdp -equity-auto
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-equity-auto` | off | enable it |
+| `-equity-symbols` | `AAPL,MSFT,NVDA,TSLA,AMD,META,AMZN,GOOGL,NFLX,COIN` | the traded basket |
+| `-equity-poll-interval` | `30s` | how often each symbol's quote is sampled |
+| `-equity-eval-interval` | `60s` | how often the strategy runs across the basket |
+| `-equity-max-position` | `0.05` | max fraction of equity per stock position — smaller than the crypto default since several can be held at once |
+
+There is no live stock tick stream elsewhere in this system — the crypto
+pipeline is fed by Binance's websocket, and building a second one just for a
+stock basket wasn't worth it here. Instead this engine polls Alpaca's quote
+endpoint on a timer and builds its own short price history from that, which
+it feeds to a bandit strategy (the same `Adaptive` used elsewhere) tuned
+faster than the crypto default — shorter arms (down to 1/3), higher
+exploration — since the point of this engine specifically is to trade often
+across several symbols rather than sit on one long-lived call.
+
+**Be honest with yourself about "trade often."** How many trades an hour
+actually happen depends on real price movement, not a schedule — this
+engine has no quota and will not manufacture a trade just to hit a number.
+Short SMA arms on 30-second-sampled quotes *will* fire often, but that also
+means it's the most whipsaw-prone, most fee-sensitive setup in this
+repository. It stays paper-only by default via the same interlock as the
+rest of the Alpaca integration. If you ever do point this at a live
+account: trading this frequently will run into Alpaca's/FINRA's Pattern Day
+Trader rule (4+ day trades in 5 business days requires $25k equity) well
+within the first day — this is not something to run against real money
+without understanding that first.
+
+---
+
 ## Backpressure — the part worth understanding
 
 Every consumer gets **its own queue** and declares **its own policy**. Sharing

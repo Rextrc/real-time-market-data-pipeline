@@ -32,6 +32,7 @@ import (
 	livebroker "github.com/Rextrc/real-time-market-data-pipeline/internal/consumer/live"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/consumer/paper"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/consumer/persist"
+	"github.com/Rextrc/real-time-market-data-pipeline/internal/equitytrader"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/instrument"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/model"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/normalize"
@@ -94,6 +95,12 @@ type config struct {
 	telegramEnabled     bool
 	telegramChatID      int64
 	telegramMaxNotional float64
+
+	equityAutoEnabled bool
+	equitySymbols     string
+	equityPollEvery   time.Duration
+	equityEvalEvery   time.Duration
+	equityMaxPosition float64
 }
 
 // env reads a configuration value from the environment, falling back to a
@@ -196,6 +203,12 @@ func run() error {
 	flag.BoolVar(&c.telegramEnabled, "telegram", envBool("MDP_TELEGRAM", false), "enable a Telegram bot that places real Alpaca orders from chat messages (needs TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALPACA_API_KEY, ALPACA_API_SECRET)")
 	flag.Int64Var(&c.telegramChatID, "telegram-chat-id", int64(envInt("TELEGRAM_CHAT_ID", 0)), "the only chat ID the bot will act on — see GETTING_STARTED.md for how to find yours")
 	flag.Float64Var(&c.telegramMaxNotional, "telegram-max-notional", envFloat("MDP_TELEGRAM_MAX_NOTIONAL", 1000), "hard dollar cap per order placed from Telegram, independent of Alpaca's own limits")
+
+	flag.BoolVar(&c.equityAutoEnabled, "equity-auto", envBool("MDP_EQUITY_AUTO", false), "automatically trade a basket of stocks through Alpaca using the adaptive bandit strategy (needs ALPACA_API_KEY, ALPACA_API_SECRET)")
+	flag.StringVar(&c.equitySymbols, "equity-symbols", env("MDP_EQUITY_SYMBOLS", "AAPL,MSFT,NVDA,TSLA,AMD,META,AMZN,GOOGL,NFLX,COIN"), "comma-separated stock tickers to trade")
+	flag.DurationVar(&c.equityPollEvery, "equity-poll-interval", envDur("MDP_EQUITY_POLL_INTERVAL", 30*time.Second), "how often each symbol's quote is sampled into this engine's own price history")
+	flag.DurationVar(&c.equityEvalEvery, "equity-eval-interval", envDur("MDP_EQUITY_EVAL_INTERVAL", 60*time.Second), "how often the strategy runs across the basket")
+	flag.Float64Var(&c.equityMaxPosition, "equity-max-position", envFloat("MDP_EQUITY_MAX_POSITION", 0.05), "max fraction of account equity per stock position — kept small since several can be held at once")
 	flag.Parse()
 
 	log := newLogger(c.logLevel)
@@ -366,6 +379,12 @@ func run() error {
 
 	if c.telegramEnabled {
 		if err := wireTelegram(ctx, c, log, g); err != nil {
+			return err
+		}
+	}
+
+	if c.equityAutoEnabled {
+		if err := wireEquityAuto(ctx, c, log, g); err != nil {
 			return err
 		}
 	}
@@ -626,6 +645,61 @@ func wireTelegram(ctx context.Context, c config, log *slog.Logger, g *errgroup.G
 	}, tgbot.New(botToken), client, log.With("component", "telegram"))
 
 	g.Go(func() error { return bot.Run(ctx) })
+	return nil
+}
+
+// wireEquityAuto connects the automatic stock-basket engine. It builds its
+// own Alpaca client, same as wireAlpaca and wireTelegram — all three are
+// independent, stateless REST clients against the same account, so any
+// subset of -alpaca / -telegram / -equity-auto can run together.
+func wireEquityAuto(ctx context.Context, c config, log *slog.Logger, g *errgroup.Group) error {
+	key := os.Getenv("ALPACA_API_KEY")
+	secret := os.Getenv("ALPACA_API_SECRET")
+	if key == "" || secret == "" {
+		return errors.New("-equity-auto requires ALPACA_API_KEY and ALPACA_API_SECRET")
+	}
+
+	symbols := strings.Split(c.equitySymbols, ",")
+	for i := range symbols {
+		symbols[i] = strings.ToUpper(strings.TrimSpace(symbols[i]))
+	}
+
+	registry := instrument.NewRegistry()
+	if err := registry.Register(binance.Symbols()...); err != nil {
+		return err
+	}
+
+	client, err := alpaca.New(alpaca.Config{
+		APIKey: key, APISecret: secret,
+		BaseURL: c.alpacaBaseURL, AllowLive: c.alpacaAllowLive,
+	}, registry, log.With("broker", "alpaca"))
+	if err != nil {
+		return err
+	}
+	if err := client.Ping(ctx); err != nil {
+		return fmt.Errorf("equity-auto: alpaca startup check failed: %w", err)
+	}
+
+	// A faster-tuned bandit than the crypto side's default: shorter arms and
+	// a higher exploration rate, since this engine is explicitly meant to
+	// trade often across a basket rather than sit on one long-lived call.
+	strat := strategy.NewAdaptive([]strategy.AdaptiveArm{
+		{Fast: 1, Slow: 3}, {Fast: 2, Slow: 5}, {Fast: 3, Slow: 8}, {Fast: 5, Slow: 13},
+	}, 0.2, 0.6)
+
+	engine := equitytrader.NewEngine(equitytrader.Config{
+		Symbols:             symbols,
+		PollInterval:        c.equityPollEvery,
+		EvalInterval:        c.equityEvalEvery,
+		MaxPositionFraction: c.equityMaxPosition,
+	}, client, strat, log.With("engine", "equity-auto"))
+
+	g.Go(func() error { return engine.Run(ctx) })
+
+	log.Warn("EQUITY AUTO-TRADING ENABLED — this engine submits real orders across a stock basket",
+		"broker", client.Name(), "symbols", symbols, "strategy", strat.Name(),
+		"max_position_fraction", c.equityMaxPosition,
+		"poll_interval", c.equityPollEvery, "eval_interval", c.equityEvalEvery)
 	return nil
 }
 
