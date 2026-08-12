@@ -1,0 +1,34 @@
+services:
+  mdp:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Named volume, not a bind mount: the archive must survive
+      # `docker compose down` and image rebuilds.
+      - mdp-data:/data
+    environment:
+      # Only needed for -strategy llm. Set it in a .env file next to this
+      # one; never commit it.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      TZ: UTC
+    command:
+      - "-db=/data/mdp.db"
+      - "-paper-state=/data/paper.json"
+      - "-http=:8080"
+      - "-symbols=BTC-USDT,ETH-USDT,SOL-USDT"
+      - "-paper"
+      - "-strategy=momentum"
+      - "-eval-interval=60s"
+    # A week-long run generates a lot of log; without rotation the host disk
+    # fills up and takes the experiment with it.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s
+
+volumes:
+  mdp-data:

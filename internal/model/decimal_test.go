@@ -92,3 +92,67 @@ func TestStringNegativeFraction(t *testing.T) {
 		t.Errorf("String() = %q, want %q", got, want)
 	}
 }
+
+// TestMulDoesNotOverflowAtCryptoScales is a regression test. A scale-8 price
+// times a scale-8 quantity has a scale-16 exact result whose mantissa is
+// around 1e20 — well past int64. Saturating there produced a nonsense
+// notional that silently rejected every paper order.
+func TestMulDoesNotOverflowAtCryptoScales(t *testing.T) {
+	price := Decimal{Unscaled: 10005000000, Scale: 8} // 100.05
+	qty := Decimal{Unscaled: 9995002499, Scale: 8}    // 99.95002499
+
+	got := price.Mul(qty).Rescale(2)
+
+	// 100.05 * 99.95002499 ≈ 10000.00
+	if f := got.Float(); f < 9999 || f > 10001 {
+		t.Errorf("Mul = %s (%.4f), want ~10000", got, f)
+	}
+}
+
+func TestMulExactWhenItFits(t *testing.T) {
+	a := Decimal{Unscaled: 150, Scale: 2} // 1.50
+	b := Decimal{Unscaled: 400, Scale: 2} // 4.00
+	if got, want := a.Mul(b).Rescale(2).String(), "6.00"; got != want {
+		t.Errorf("1.50 * 4.00 = %s, want %s", got, want)
+	}
+}
+
+func TestAddAcrossScales(t *testing.T) {
+	a := Decimal{Unscaled: 1, Scale: 8}   // 0.00000001
+	b := Decimal{Unscaled: 100, Scale: 2} // 1.00
+	if got, want := a.Add(b).String(), "1.00000001"; got != want {
+		t.Errorf("sum = %s, want %s", got, want)
+	}
+}
+
+func TestSumOfManyQuantitiesStaysExact(t *testing.T) {
+	// A trading day's volume accumulator: a float would drift here.
+	var total Decimal
+	one := Decimal{Unscaled: 1, Scale: 8} // 0.00000001
+	for i := 0; i < 100000; i++ {
+		total = total.Add(one)
+	}
+	if got, want := total.String(), "0.00100000"; got != want {
+		t.Errorf("sum of 100000 * 0.00000001 = %s, want %s", got, want)
+	}
+}
+
+func TestCmpAcrossScales(t *testing.T) {
+	if !(Decimal{Unscaled: 150, Scale: 2}).Equal(Decimal{Unscaled: 15, Scale: 1}) {
+		t.Error("1.50 should equal 1.5")
+	}
+	if !(Decimal{Unscaled: 999, Scale: 3}).Less(Decimal{Unscaled: 1, Scale: 0}) {
+		t.Error("0.999 should be less than 1")
+	}
+}
+
+func TestDivRoundsHalfAwayFromZero(t *testing.T) {
+	ten := Decimal{Unscaled: 1000, Scale: 2}
+	three := Decimal{Unscaled: 300, Scale: 2}
+	if got, want := ten.Div(three, 4).String(), "3.3333"; got != want {
+		t.Errorf("10/3 = %s, want %s", got, want)
+	}
+	if got := ten.Div(Decimal{}, 2); !got.IsZero() {
+		t.Errorf("division by zero = %s, want zero", got)
+	}
+}

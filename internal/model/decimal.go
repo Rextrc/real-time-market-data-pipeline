@@ -106,3 +106,35 @@ func (d Decimal) String() string {
 
 // IsZero reports whether the value is exactly zero at any scale.
 func (d Decimal) IsZero() bool { return d.Unscaled == 0 }
+
+// MarshalJSON emits the value as a JSON string, not a number.
+//
+// A JSON number would be parsed as a float64 by almost every client,
+// reintroducing at the API boundary exactly the precision loss this type
+// exists to prevent. Every serious financial API quotes prices as strings
+// for this reason.
+func (d Decimal) MarshalJSON() ([]byte, error) {
+	s := d.String()
+	out := make([]byte, 0, len(s)+2)
+	out = append(out, '"')
+	out = append(out, s...)
+	return append(out, '"'), nil
+}
+
+// UnmarshalJSON accepts a quoted decimal string, and also a bare JSON number
+// so that hand-written payloads still work.
+func (d *Decimal) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "null" {
+		*d = Decimal{}
+		return nil
+	}
+	s = strings.Trim(s, `"`)
+
+	parsed, err := ParseDecimal(s)
+	if err != nil {
+		return err
+	}
+	*d = parsed
+	return nil
+}

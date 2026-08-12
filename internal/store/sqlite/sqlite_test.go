@@ -1,0 +1,245 @@
+package sqlite
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/Rextrc/real-time-market-data-pipeline/internal/model"
+	"github.com/Rextrc/real-time-market-data-pipeline/internal/store"
+)
+
+func open(t *testing.T) *DB {
+	t.Helper()
+	db, err := Open(context.Background(), filepath.Join(t.TempDir(), "test.db"), DurabilityOff)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func mkTick(id model.InstrumentID, tradeID string, tsMillis int64, price string) model.Tick {
+	p, err := model.ParseDecimal(price)
+	if err != nil {
+		panic(err)
+	}
+	return model.Tick{
+		Venue: model.VenueBinance, Instrument: id, VenueTradeID: tradeID, Seq: 1,
+		EventTime: time.UnixMilli(tsMillis).UTC(),
+		RecvTime:  time.UnixMilli(tsMillis + 50).UTC(),
+		Price:     p,
+		Quantity:  model.Decimal{Unscaled: 125, Scale: 3},
+		Side:      model.SideBuy,
+	}
+}
+
+func TestAppendAndReadRoundTrip(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	in := mkTick("BTC-USDT", "1", 1710000000000, "68420.51000000")
+	if n, err := db.Append(ctx, []model.Tick{in}); err != nil || n != 1 {
+		t.Fatalf("Append = %d, %v", n, err)
+	}
+
+	got, err := db.Latest(ctx, model.VenueBinance, "BTC-USDT")
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+
+	// Exactness through the storage layer is the whole point: a price that
+	// round-trips as a float would be silently wrong here.
+	if got.Price.String() != in.Price.String() {
+		t.Errorf("Price = %q, want %q", got.Price, in.Price)
+	}
+	if got.Quantity.String() != in.Quantity.String() {
+		t.Errorf("Quantity = %q, want %q", got.Quantity, in.Quantity)
+	}
+	if !got.EventTime.Equal(in.EventTime) {
+		t.Errorf("EventTime = %v, want %v", got.EventTime, in.EventTime)
+	}
+	if got.Side != in.Side || got.VenueTradeID != in.VenueTradeID {
+		t.Errorf("got %+v, want side=%v id=%s", got, in.Side, in.VenueTradeID)
+	}
+}
+
+// TestAppendIsIdempotent is the property every consumer depends on once
+// delivery becomes at-least-once. A reconnect that replays overlapping trades
+// must not double-count them.
+func TestAppendIsIdempotent(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	batch := []model.Tick{
+		mkTick("BTC-USDT", "1", 1710000000000, "100.00"),
+		mkTick("BTC-USDT", "2", 1710000001000, "101.00"),
+	}
+
+	if n, _ := db.Append(ctx, batch); n != 2 {
+		t.Fatalf("first append stored %d, want 2", n)
+	}
+	n, err := db.Append(ctx, batch)
+	if err != nil {
+		t.Fatalf("re-append: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("re-append stored %d rows, want 0 — replay must be a no-op", n)
+	}
+
+	page, err := db.Ticks(ctx, store.Query{Instrument: "BTC-USDT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Ticks) != 2 {
+		t.Errorf("archive holds %d ticks after replay, want 2", len(page.Ticks))
+	}
+}
+
+func TestTicksTimeRangeAndOrder(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	var batch []model.Tick
+	for i := 0; i < 10; i++ {
+		batch = append(batch, mkTick("BTC-USDT", string(rune('a'+i)), 1710000000000+int64(i)*1000, "100.00"))
+	}
+	if _, err := db.Append(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := db.Ticks(ctx, store.Query{
+		Instrument: "BTC-USDT",
+		Start:      time.UnixMilli(1710000003000).UTC(),
+		End:        time.UnixMilli(1710000007000).UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Start inclusive, End exclusive → indices 3,4,5,6.
+	if len(page.Ticks) != 4 {
+		t.Fatalf("got %d ticks, want 4", len(page.Ticks))
+	}
+	for i := 1; i < len(page.Ticks); i++ {
+		if page.Ticks[i].EventTime.Before(page.Ticks[i-1].EventTime) {
+			t.Error("results are not in ascending event-time order")
+		}
+	}
+}
+
+// TestKeysetPagingCoversEveryRowExactlyOnce is why paging is cursor-based
+// rather than OFFSET-based: on a live feed, rows arriving mid-scan would make
+// an offset skip or repeat records.
+func TestKeysetPagingCoversEveryRowExactlyOnce(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	const total = 25
+	var batch []model.Tick
+	for i := 0; i < total; i++ {
+		batch = append(batch, mkTick("BTC-USDT", string(rune('A'+i)), 1710000000000+int64(i)*1000, "100.00"))
+	}
+	if _, err := db.Append(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]int{}
+	q := store.Query{Instrument: "BTC-USDT", Limit: 7}
+	for pages := 0; ; pages++ {
+		if pages > 10 {
+			t.Fatal("paging did not terminate")
+		}
+		page, err := db.Ticks(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tk := range page.Ticks {
+			seen[tk.VenueTradeID]++
+		}
+		if !page.HasMore {
+			break
+		}
+		q.Cursor = page.NextCursor
+	}
+
+	if len(seen) != total {
+		t.Errorf("saw %d distinct rows, want %d", len(seen), total)
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("row %s returned %d times, want once", id, n)
+		}
+	}
+}
+
+func TestLatestNotFound(t *testing.T) {
+	db := open(t)
+	if _, err := db.Latest(context.Background(), model.VenueBinance, "NOPE-USDT"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("err = %v, want store.ErrNotFound", err)
+	}
+}
+
+func TestInstrumentsSummary(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	_, err := db.Append(ctx, []model.Tick{
+		mkTick("BTC-USDT", "1", 1710000000000, "100.00"),
+		mkTick("BTC-USDT", "2", 1710000005000, "101.00"),
+		mkTick("ETH-USDT", "3", 1710000002000, "50.00"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := db.Instruments(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 2 {
+		t.Fatalf("got %d instruments, want 2", len(stats))
+	}
+	for _, s := range stats {
+		if s.Instrument == "BTC-USDT" {
+			if s.Ticks != 2 {
+				t.Errorf("BTC ticks = %d, want 2", s.Ticks)
+			}
+			if !s.First.Equal(time.UnixMilli(1710000000000).UTC()) {
+				t.Errorf("BTC first = %v", s.First)
+			}
+			if !s.Last.Equal(time.UnixMilli(1710000005000).UTC()) {
+				t.Errorf("BTC last = %v", s.Last)
+			}
+		}
+	}
+}
+
+func TestRawFramesPersisted(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	err := db.AppendRawBatch(ctx, []RawFrame{
+		{Venue: model.VenueBinance, RecvTime: time.Now().UTC(), Payload: []byte(`{"a":1}`)},
+		{Venue: model.VenueBinance, RecvTime: time.Now().UTC(), Payload: []byte(`{"b":2}`)},
+	})
+	if err != nil {
+		t.Fatalf("AppendRawBatch: %v", err)
+	}
+
+	var n int
+	if err := db.db.QueryRow(`SELECT COUNT(*) FROM raw_frames`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("raw_frames holds %d rows, want 2", n)
+	}
+}
+
+func TestUnknownDurabilityRejected(t *testing.T) {
+	_, err := Open(context.Background(), filepath.Join(t.TempDir(), "x.db"), Durability("sometimes"))
+	if err == nil {
+		t.Error("expected an error for an unrecognized durability setting")
+	}
+}

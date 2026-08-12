@@ -1,4 +1,9 @@
 /mdp
+/fakevenue
+/data/
 *.db
 *.db-wal
 *.db-shm
+paper.json
+paper.json.tmp
+.env
