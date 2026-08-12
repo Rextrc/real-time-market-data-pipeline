@@ -13,6 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"os"
+	"path/filepath"
+
 	_ "modernc.org/sqlite" // pure-Go driver: no cgo, so cross-compilation stays trivial
 
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/model"
@@ -85,7 +88,18 @@ type DB struct {
 }
 
 // Open creates or opens the database at path and applies the schema.
+//
+// The parent directory is created if missing. Without this, the default
+// path "data/mdp.db" fails on a fresh checkout before a single tick has
+// arrived — a bad first impression for a flag whose whole point is "don't
+// make the user think about this."
 func Open(ctx context.Context, path string, d Durability) (*DB, error) {
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("sqlite: create %s: %w", dir, err)
+		}
+	}
+
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open %s: %w", path, err)
