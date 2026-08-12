@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -241,5 +242,147 @@ func TestUnknownDurabilityRejected(t *testing.T) {
 	_, err := Open(context.Background(), filepath.Join(t.TempDir(), "x.db"), Durability("sometimes"))
 	if err == nil {
 		t.Error("expected an error for an unrecognized durability setting")
+	}
+}
+
+func TestPruneByAge(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	recent := time.Now().UTC().Add(-1 * time.Hour)
+
+	var batch []model.Tick
+	for i := 0; i < 5; i++ {
+		batch = append(batch, mkTick("BTC-USDT", "old"+string(rune('a'+i)), old.UnixMilli()+int64(i), "100.00"))
+	}
+	for i := 0; i < 5; i++ {
+		batch = append(batch, mkTick("BTC-USDT", "new"+string(rune('a'+i)), recent.UnixMilli()+int64(i), "100.00"))
+	}
+	if _, err := db.Append(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AppendRawBatch(ctx, []RawFrame{
+		{Venue: model.VenueBinance, RecvTime: old, Payload: []byte("{}")},
+		{Venue: model.VenueBinance, RecvTime: recent, Payload: []byte("{}")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	ticks, raw, err := db.Prune(ctx, cutoff, cutoff)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if ticks != 5 {
+		t.Errorf("deleted %d ticks, want 5", ticks)
+	}
+	if raw != 1 {
+		t.Errorf("deleted %d raw frames, want 1", raw)
+	}
+
+	page, err := db.Ticks(ctx, store.Query{Instrument: "BTC-USDT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Ticks) != 5 {
+		t.Errorf("%d ticks remain, want 5", len(page.Ticks))
+	}
+	for _, tk := range page.Ticks {
+		if tk.EventTime.Before(cutoff) {
+			t.Errorf("tick %s survived the cutoff", tk.VenueTradeID)
+		}
+	}
+}
+
+func TestPruneZeroCutoffKeepsEverything(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	if _, err := db.Append(ctx, []model.Tick{
+		mkTick("BTC-USDT", "1", time.Now().Add(-999*time.Hour).UnixMilli(), "100.00"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A zero cutoff means "keep forever" — it must not be read as
+	// "delete everything before the zero time", and certainly not as
+	// "delete everything".
+	ticks, raw, err := db.Prune(ctx, time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ticks != 0 || raw != 0 {
+		t.Errorf("zero cutoff deleted %d ticks and %d raw frames, want 0 and 0", ticks, raw)
+	}
+}
+
+// TestPruneToSizeReclaimsSpace is the last-resort guard for a fixed-size
+// volume. It must actually shrink the file, not just the row count —
+// deleting rows alone leaves the pages on SQLite's freelist.
+func TestPruneToSizeReclaimsSpace(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	// Several distinct days so there is something to drop partition-wise.
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for day := 0; day < 6; day++ {
+		var batch []model.Tick
+		for i := 0; i < 2000; i++ {
+			ts := base.AddDate(0, 0, day).Add(time.Duration(i) * time.Second)
+			batch = append(batch, mkTick("BTC-USDT",
+				fmt.Sprintf("d%d-%d", day, i), ts.UnixMilli(), "68420.51000000"))
+		}
+		if _, err := db.Append(ctx, batch); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before, err := db.SizeBytes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := before / 2
+
+	deleted, err := db.PruneToSize(ctx, target)
+	if err != nil {
+		t.Fatalf("PruneToSize: %v", err)
+	}
+	if deleted == 0 {
+		t.Fatal("PruneToSize deleted nothing")
+	}
+
+	after, err := db.SizeBytes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after >= before {
+		t.Errorf("size did not shrink: %d -> %d (freed pages must be returned, not left on the freelist)",
+			before, after)
+	}
+
+	// The oldest day must be the one that went.
+	page, err := db.Ticks(ctx, store.Query{Instrument: "BTC-USDT", Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Ticks) > 0 && page.Ticks[0].EventTime.Before(base.AddDate(0, 0, 1)) {
+		t.Error("oldest day survived; pruning must drop oldest-first")
+	}
+}
+
+func TestPruneToSizeNoopWhenUnderCap(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+
+	if _, err := db.Append(ctx, []model.Tick{mkTick("BTC-USDT", "1", 1710000000000, "100.00")}); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := db.PruneToSize(ctx, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted %d rows while under the cap, want 0", deleted)
 	}
 }

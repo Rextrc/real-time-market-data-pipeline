@@ -50,8 +50,9 @@ rebuilds do not take your captured history with them.
 | `GET /v1/quote/{instrument}` | latest trade |
 | `GET /v1/candles/{instrument}?limit=100` | OHLCV bars |
 | `GET /v1/ticks?instrument=&start=&end=&limit=&order=` | historical range, cursor-paged |
-| `GET /v1/paper` | account snapshot: equity, P&L, drawdown, positions |
-| `GET /v1/paper/fills?limit=100` | trade log, each with the reason it fired |
+| `GET /v1/paper` | scoreboard: every strategy side by side |
+| `GET /v1/paper/{strategy}` | one account: equity, P&L, drawdown, positions |
+| `GET /v1/paper/{strategy}/fills?limit=100` | trade log, each with the reason it fired |
 | `WS /v1/stream?instruments=BTC-USDT` | live ticks |
 
 ```sh
@@ -74,7 +75,7 @@ go run ./cmd/mdp -paper -strategy momentum
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-strategy` | `momentum` | `momentum`, `llm`, or `llm+momentum` |
+| `-strategy` | `momentum` | comma-separated: `momentum`, `meanrev`, `llm`, `llm+momentum` — each gets its own independent account on identical data |
 | `-paper-cash` | `10000` | starting balance |
 | `-paper-fee` | `0.001` | fee per fill (10bps, ≈ Binance spot taker) |
 | `-paper-slippage` | `0.0005` | spread crossed per fill |
@@ -102,6 +103,10 @@ a good reason to expect no free money in one. On liquid pairs, after fees,
 they historically bleed in ranging markets and make it back only in sustained
 trends. Its P&L is the number any other strategy has to beat.
 
+**`meanrev`** — buys when price falls 2σ below its 30-bar mean and sells when
+it reverts. Deliberately near-opposite to momentum, so the two disagree most
+of the time and the pair is more informative than either alone.
+
 **`llm`** — asks Claude for a buy/sell/hold per instrument from recent
 candles. Needs `ANTHROPIC_API_KEY`. **`llm+momentum`** additionally shows the
 model the baseline's signals so it can agree or disagree explicitly.
@@ -120,9 +125,9 @@ sizing, the per-position cap, and the cash check are enforced by the engine,
 so a confused response cannot do anything worse than a bad trade — and an
 unparseable one becomes a hold, never a guess.
 
-**Cost:** an evaluation is one API call. At `-eval-interval 60s` that's ~1,440
-calls/day; the system prompt is cached, so most of the per-call input bills at
-cache-read rates. Raise the interval to cut it.
+**Cost:** an evaluation is one API call, and at the 60s default that is
+~43,000 calls a month. See the cost table under *Deploying to Railway* before
+running this unattended.
 
 ---
 
@@ -214,6 +219,138 @@ that still can't keep up (`kicked` in `/metrics`).
 ```sh
 go run ./cmd/mdp -durability off    # vs. normal, vs. full
 ```
+
+---
+
+## Deploying to Railway
+
+The Dockerfile is the build; `railway.json` sets the health check and restart
+policy. Two things will silently ruin a long run if you skip them.
+
+**1. Attach a Volume, mounted at `/data`.** Railway's container filesystem is
+ephemeral — without a volume, every redeploy and every restart wipes the
+archive *and* the paper books, and a month-long experiment quietly restarts
+from zero each time you push. `MDP_DB` and `MDP_PAPER_STATE` already point at
+`/data`.
+
+**2. Set retention to fit that volume.** See the sizing table below. Ingest
+never stops; an unbounded archive ends the run when the disk fills.
+
+`PORT` is injected by Railway and taken automatically — don't set `MDP_HTTP`.
+
+### Environment variables
+
+Every flag has an `MDP_`-prefixed equivalent. The ones that matter:
+
+| Variable | Suggested | Why |
+|---|---|---|
+| `MDP_SYMBOLS` | `BTC-USDT,ETH-USDT,SOL-USDT` | more symbols = proportionally more disk |
+| `MDP_PAPER` | `true` | enable trading |
+| `MDP_STRATEGY` | `momentum,meanrev` | comma-separated; each gets its own account |
+| `MDP_EVAL_INTERVAL` | `60s` (`15m` if using `llm`) | see the cost table |
+| `MDP_RETAIN_RAW` | `24h` | raw frames are ~2/3 of the bytes |
+| `MDP_RETAIN_TICKS` | fit your volume | `0` keeps forever |
+| `MDP_MAX_DB_BYTES` | ~80% of volume | last-resort guard |
+| `ANTHROPIC_API_KEY` | — | only for `llm` strategies |
+
+### Sizing a month
+
+Measured at ~434 bytes per tick with raw frames stored, ~150 without. At a
+realistic ~50 trades/sec across three majors:
+
+| | with raw | normalized only |
+|---|---|---|
+| per day | ~1.9 GB | ~0.65 GB |
+| per month | ~56 GB | ~20 GB |
+
+So a month of everything does not fit on a small volume, and the interesting
+question is what to throw away. Settings that fit:
+
+| Volume | `MDP_RETAIN_RAW` | `MDP_RETAIN_TICKS` | `MDP_MAX_DB_BYTES` |
+|---|---|---|---|
+| 5 GB | `6h` | `144h` (6 days) | `4000000000` |
+| 10 GB | `24h` | `336h` (14 days) | `8000000000` |
+| 50 GB | `72h` | `0` (keep all) | `40000000000` |
+
+Retention runs hourly, deletes by age, and then drops whole days oldest-first
+if the database is still over `MDP_MAX_DB_BYTES`. Freed pages are returned to
+the filesystem via incremental auto-vacuum.
+
+**A database created before this feature existed cannot reclaim space** — the
+`auto_vacuum` mode is fixed at creation and silently ignores later attempts to
+change it. The process warns at startup if it detects one; restart once with
+`-vacuum-on-start` (or `MDP_VACUUM_ON_START=true`) to rebuild it.
+
+### LLM cost over a month
+
+An LLM evaluation is one API call, and the candle payload dominates the tokens
+— the cached system prompt is a small fraction, so caching saves less here
+than you'd hope. Rough monthly totals at ~2,100 input and ~300 output tokens
+per call:
+
+| interval | calls/month | Opus 5 | Sonnet 5 | Haiku 4.5 |
+|---|---|---|---|---|
+| `60s` | 43,200 | ~$790 | ~$470 | ~$160 |
+| `5m` | 8,640 | ~$160 | ~$95 | ~$30 |
+| `15m` | 2,880 | ~$50 | ~$30 | ~$10 |
+| `1h` | 720 | ~$13 | ~$8 | ~$3 |
+
+Estimates from list prices at time of writing — check current pricing. **The
+60s default is fine for `momentum` and expensive for `llm`.** Set
+`MDP_EVAL_INTERVAL=15m` and `MDP_LLM_MODEL=claude-haiku-4-5` unless you have a
+reason not to; the process logs its projected call count at startup and warns
+below 5 minutes.
+
+A 15-minute cadence is not a handicap for this strategy. It reads candles, not
+order flow — there is nothing in the data at 60s that isn't in it at 15m.
+
+---
+
+## Running a month
+
+```
+MDP_PAPER=true
+MDP_STRATEGY=momentum,meanrev
+MDP_RETAIN_RAW=24h
+MDP_RETAIN_TICKS=336h
+MDP_MAX_DB_BYTES=8000000000
+```
+
+Watch the scoreboard:
+
+```sh
+curl -s $URL/v1/paper | jq '.strategies[] | {strategy, pl: .account.total_pl, trades: .account.trades}'
+curl -s $URL/metrics | jq '{archive, subscribers: [.subscribers[] | {name, dropped}]}'
+```
+
+Two operational facts worth knowing before you start:
+
+**Candle history is in memory, not on disk.** After a restart or redeploy the
+builder starts empty, and `momentum(9/27)` needs 29 closed bars before it can
+signal — about half an hour on 1-minute candles. Paper books survive (they're
+on the volume); the warm-up doesn't. Redeploying daily means the strategies
+spend a meaningful share of the month blind, so batch your changes.
+
+**`dropped` climbing on the persister means the disk can't keep up.** It's the
+one counter worth alerting on. `blocked_nanos` above zero anywhere means
+something is applying backpressure to ingest — on a live feed, that's an
+incident.
+
+### What a month will and won't tell you
+
+It's a real test of the *system*: 720 hours of reconnects, redeploys, disk
+pressure, and exchange hiccups is a genuine soak test, and things that survive
+that usually work.
+
+It is **not** a verdict on the strategies. A month is one sample of one
+market regime. Momentum and mean reversion are near-opposites by construction,
+so the informative result isn't which one won — it's the shape: if both made
+money, the market trended and chopped in turn; if both lost, you're looking at
+fees; if they mirror each other, you're looking at noise. Read the pair, not
+the winner.
+
+Nothing here can place a real order. There is no exchange credential in the
+system and no code path to one.
 
 ---
 

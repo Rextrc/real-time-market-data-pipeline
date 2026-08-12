@@ -20,6 +20,12 @@ import (
 )
 
 const schema = `
+-- auto_vacuum MUST be set before anything writes to the file, including
+-- journal_mode. SQLite only allows the mode to change while the database is
+-- still new; afterwards the pragma is silently ignored — no error, it just
+-- stays at "none" and every later incremental_vacuum is a no-op. The symptom
+-- is deleted rows that never shrink the file.
+PRAGMA auto_vacuum = INCREMENTAL;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA busy_timeout = 5000;
@@ -373,6 +379,137 @@ func scanTick(sc scanner) (model.Tick, error) {
 		Side:         model.Side(side),
 		VenueTradeID: tradeID,
 	}, nil
+}
+
+// Prune deletes data older than the given cutoffs. A zero cutoff means
+// "keep forever" for that table.
+//
+// Retention is the difference between a month-long run and a run that dies
+// on day nine with a full disk. Raw frames are the bulk of it — they are
+// worth keeping for a day or two so a decoder bug is recoverable, and not
+// worth keeping for a month.
+func (s *DB) Prune(ctx context.Context, ticksBefore, rawBefore time.Time) (deletedTicks, deletedRaw int64, err error) {
+
+	if !rawBefore.IsZero() {
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM raw_frames WHERE recv_ts_ns < ?`, rawBefore.UnixNano())
+		if err != nil {
+			return 0, 0, fmt.Errorf("sqlite: prune raw: %w", err)
+		}
+		deletedRaw, _ = res.RowsAffected()
+	}
+
+	if !ticksBefore.IsZero() {
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM ticks WHERE event_ts_ns < ?`, ticksBefore.UnixNano())
+		if err != nil {
+			return deletedTicks, deletedRaw, fmt.Errorf("sqlite: prune ticks: %w", err)
+		}
+		deletedTicks, _ = res.RowsAffected()
+	}
+
+	if deletedTicks > 0 || deletedRaw > 0 {
+		// Hand the freed pages back to the filesystem rather than leaving
+		// them on the freelist.
+		if _, err := s.db.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
+			return deletedTicks, deletedRaw, fmt.Errorf("sqlite: incremental vacuum: %w", err)
+		}
+	}
+	return deletedTicks, deletedRaw, nil
+}
+
+// PruneOldestTicks deletes whole days of ticks, oldest first, until the
+// database is under the given size. It is the last-resort guard for a
+// fixed-size volume: better to lose the oldest history than to have writes
+// start failing and take the whole run down.
+//
+// It deletes by day partition rather than by row count so the archive stays
+// a set of complete days.
+func (s *DB) PruneToSize(ctx context.Context, maxBytes int64) (deletedTicks int64, err error) {
+	if maxBytes <= 0 {
+		return 0, nil
+	}
+
+	for i := 0; i < 400; i++ { // bounded: ~a year of daily partitions
+		size, err := s.SizeBytes(ctx)
+		if err != nil || size <= maxBytes {
+			return deletedTicks, err
+		}
+
+		var day string
+		err = s.db.QueryRowContext(ctx, `SELECT MIN(day) FROM ticks`).Scan(&day)
+		if errors.Is(err, sql.ErrNoRows) || day == "" {
+			return deletedTicks, nil
+		}
+		if err != nil {
+			return deletedTicks, fmt.Errorf("sqlite: find oldest day: %w", err)
+		}
+
+		res, err := s.db.ExecContext(ctx, `DELETE FROM ticks WHERE day = ?`, day)
+		if err != nil {
+			return deletedTicks, fmt.Errorf("sqlite: prune day %s: %w", day, err)
+		}
+		n, _ := res.RowsAffected()
+		deletedTicks += n
+
+		if _, err := s.db.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
+			return deletedTicks, fmt.Errorf("sqlite: incremental vacuum: %w", err)
+		}
+		if n == 0 {
+			return deletedTicks, nil // nothing more to reclaim
+		}
+	}
+	return deletedTicks, nil
+}
+
+// NeedsVacuum reports whether this database predates incremental auto-vacuum
+// and therefore cannot return freed pages to the filesystem.
+//
+// A file created before that pragma was set keeps auto_vacuum at "none"
+// forever, and the only way to adopt it is a full VACUUM — which rewrites
+// the entire database and is far too slow to do implicitly at startup on a
+// multi-gigabyte archive. So this reports the condition and leaves the
+// decision to the operator.
+func (s *DB) NeedsVacuum(ctx context.Context) (bool, error) {
+	var mode int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		return false, err
+	}
+	return mode != 2, nil
+}
+
+// Vacuum rebuilds the database, adopting incremental auto-vacuum and
+// compacting the file. It rewrites everything and holds a write lock for the
+// duration, so it is an explicit operation, never automatic.
+func (s *DB) Vacuum(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA auto_vacuum = INCREMENTAL`); err != nil {
+		return fmt.Errorf("sqlite: set auto_vacuum: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
+		return fmt.Errorf("sqlite: vacuum: %w", err)
+	}
+	return nil
+}
+
+// SizeBytes reports the database's on-disk size as SQLite sees it.
+func (s *DB) SizeBytes(ctx context.Context) (int64, error) {
+	var pageCount, pageSize int64
+	if err := s.db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
+		return 0, err
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
+		return 0, err
+	}
+	return pageCount * pageSize, nil
+}
+
+// Counts reports row counts for the metrics endpoint.
+func (s *DB) Counts(ctx context.Context) (ticks, raw int64, err error) {
+	if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM ticks`).Scan(&ticks); err != nil {
+		return
+	}
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM raw_frames`).Scan(&raw)
+	return
 }
 
 // day is the partition key: the UTC date of the event.

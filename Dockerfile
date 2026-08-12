@@ -40,7 +40,12 @@ EXPOSE 8080
 ENV TZ=UTC
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+    CMD wget -qO- "http://127.0.0.1:${PORT:-8080}/healthz" || exit 1
+
+# Configuration comes from environment variables (MDP_*), not baked-in flags,
+# because that is how Railway and most PaaS configure a service. PORT is
+# injected by the platform and takes precedence over MDP_HTTP.
+ENV MDP_DB=/data/mdp.db \
+    MDP_PAPER_STATE=/data/paper.json
 
 ENTRYPOINT ["/usr/local/bin/mdp"]
-CMD ["-db", "/data/mdp.db", "-paper-state", "/data/paper.json", "-http", ":8080"]

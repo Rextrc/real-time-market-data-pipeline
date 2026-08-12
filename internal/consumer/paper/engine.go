@@ -16,6 +16,10 @@ import (
 
 // EngineConfig tunes the trading loop.
 type EngineConfig struct {
+	// Name identifies this account in the API and in log lines. With
+	// several strategies running side by side it is the only way to tell
+	// their results apart.
+	Name string
 	// EvalInterval is how often the strategy is asked for signals.
 	// Evaluating per tick would tie strategy cost to market volatility,
 	// which loads the system hardest exactly when it is busiest.
@@ -110,6 +114,14 @@ func (e *Engine) Instruments() []model.InstrumentID {
 var _ strategy.Market = (*Engine)(nil)
 
 // -----------------------------------------------------------------------
+
+// Name identifies this account.
+func (e *Engine) Name() string {
+	if e.cfg.Name == "" {
+		return e.strat.Name()
+	}
+	return e.cfg.Name
+}
 
 // Account exposes the book for the API.
 func (e *Engine) Account() *Account { return e.acct }

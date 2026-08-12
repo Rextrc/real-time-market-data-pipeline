@@ -26,7 +26,7 @@ type Deps struct {
 	Store       store.Reader
 	Bus         bus.Bus
 	Candles     *candles.Builder
-	Paper       *paper.Engine
+	Paper       []*paper.Engine
 	Persister   *persist.Persister
 	Venue       model.VenueID
 	Instruments []model.InstrumentID
@@ -52,8 +52,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/quote/{instrument}", s.quote)
 	mux.HandleFunc("GET /v1/candles/{instrument}", s.candlesFor)
 	mux.HandleFunc("GET /v1/ticks", s.ticks)
-	mux.HandleFunc("GET /v1/paper", s.paperSnapshot)
-	mux.HandleFunc("GET /v1/paper/fills", s.paperFills)
+	mux.HandleFunc("GET /v1/paper", s.paperAll)
+	mux.HandleFunc("GET /v1/paper/{strategy}", s.paperOne)
+	mux.HandleFunc("GET /v1/paper/{strategy}/fills", s.paperFills)
 
 	return logging(s.deps.Log, mux)
 }
@@ -81,14 +82,36 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	if s.deps.Persister != nil {
 		out["persist"] = s.deps.Persister.Stats()
 	}
-	if s.deps.Paper != nil {
-		snap := s.deps.Paper.Account().Snapshot(time.Now().UTC())
-		out["paper"] = map[string]any{
-			"equity":     snap.Equity,
-			"total_pl":   snap.TotalPL,
-			"return_pct": snap.ReturnPct,
-			"trades":     snap.Trades,
+	if len(s.deps.Paper) > 0 {
+		accounts := make(map[string]any, len(s.deps.Paper))
+		for _, e := range s.deps.Paper {
+			snap := e.Account().Snapshot(time.Now().UTC())
+			accounts[e.Name()] = map[string]any{
+				"equity":     snap.Equity,
+				"total_pl":   snap.TotalPL,
+				"return_pct": snap.ReturnPct,
+				"trades":     snap.Trades,
+			}
 		}
+		out["paper"] = accounts
+	}
+
+	// Archive size is the number that decides whether a long run survives on
+	// a fixed-size volume, so it belongs next to the queue depths.
+	if sizer, ok := s.deps.Store.(interface {
+		SizeBytes(context.Context) (int64, error)
+		Counts(context.Context) (int64, int64, error)
+	}); ok {
+		archive := map[string]any{}
+		if size, err := sizer.SizeBytes(r.Context()); err == nil {
+			archive["bytes"] = size
+			archive["mb"] = size / (1 << 20)
+		}
+		if ticks, raw, err := sizer.Counts(r.Context()); err == nil {
+			archive["ticks"] = ticks
+			archive["raw_frames"] = raw
+		}
+		out["archive"] = archive
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -196,26 +219,57 @@ func (s *Server) ticks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) paperSnapshot(w http.ResponseWriter, r *http.Request) {
-	if s.deps.Paper == nil {
+// paperAll is the scoreboard: every strategy side by side on identical data.
+func (s *Server) paperAll(w http.ResponseWriter, r *http.Request) {
+	if len(s.deps.Paper) == 0 {
 		writeError(w, http.StatusNotFound, errors.New("paper trading not enabled"))
 		return
 	}
-	snap := s.deps.Paper.Account().Snapshot(time.Now().UTC())
+
+	now := time.Now().UTC()
+	results := make([]map[string]any, 0, len(s.deps.Paper))
+	for _, e := range s.deps.Paper {
+		results = append(results, map[string]any{
+			"name":     e.Name(),
+			"strategy": e.StrategyName(),
+			"account":  e.Account().Snapshot(now),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"strategies": results})
+}
+
+func (s *Server) paperOne(w http.ResponseWriter, r *http.Request) {
+	e := s.engine(r.PathValue("strategy"))
+	if e == nil {
+		writeError(w, http.StatusNotFound, errors.New("no such strategy"))
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"strategy": s.deps.Paper.StrategyName(),
-		"account":  snap,
+		"name":     e.Name(),
+		"strategy": e.StrategyName(),
+		"account":  e.Account().Snapshot(time.Now().UTC()),
 	})
 }
 
 func (s *Server) paperFills(w http.ResponseWriter, r *http.Request) {
-	if s.deps.Paper == nil {
-		writeError(w, http.StatusNotFound, errors.New("paper trading not enabled"))
+	e := s.engine(r.PathValue("strategy"))
+	if e == nil {
+		writeError(w, http.StatusNotFound, errors.New("no such strategy"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"fills": s.deps.Paper.Account().Fills(intParam(r, "limit", 100)),
+		"name":  e.Name(),
+		"fills": e.Account().Fills(intParam(r, "limit", 100)),
 	})
+}
+
+func (s *Server) engine(name string) *paper.Engine {
+	for _, e := range s.deps.Paper {
+		if e.Name() == name {
+			return e
+		}
+	}
+	return nil
 }
 
 // Serve runs the HTTP server and shuts it down cleanly on context cancel.

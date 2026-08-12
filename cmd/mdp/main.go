@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -31,6 +33,7 @@ import (
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/instrument"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/model"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/normalize"
+	"github.com/Rextrc/real-time-market-data-pipeline/internal/store"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/store/sqlite"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/strategy"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/supervise"
@@ -70,33 +73,102 @@ type config struct {
 	fillLatency  time.Duration
 	paperState   string
 	llmModel     string
+
+	retainTicks   time.Duration
+	retainRaw     time.Duration
+	maxDBBytes    int64
+	retainEvery   time.Duration
+	vacuumOnStart bool
+}
+
+// env reads a configuration value from the environment, falling back to a
+// default. Railway (and most PaaS) configure a service through environment
+// variables rather than command-line flags, so every flag below can also be
+// set as MDP_<FLAG> — with the exception of PORT, which the platform injects
+// itself and which must win.
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envDur(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return def
+}
+
+// defaultHTTPAddr honours the platform-injected PORT. Binding to a hardcoded
+// port on Railway means the health check never passes and the deploy is
+// rolled back with no obvious reason.
+func defaultHTTPAddr() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return ":" + p
+	}
+	return env("MDP_HTTP", ":8080")
 }
 
 func run() error {
 	var c config
-	flag.StringVar(&c.symbols, "symbols", "BTC-USDT,ETH-USDT,SOL-USDT", "canonical instrument IDs")
-	flag.StringVar(&c.endpoint, "endpoint", binance.DefaultEndpoint, "websocket endpoint")
-	flag.StringVar(&c.dbPath, "db", "data/mdp.db", "SQLite database path")
-	flag.StringVar(&c.httpAddr, "http", ":8080", "HTTP listen address; empty disables the API")
+	flag.StringVar(&c.symbols, "symbols", env("MDP_SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT"), "canonical instrument IDs")
+	flag.StringVar(&c.endpoint, "endpoint", env("MDP_ENDPOINT", binance.DefaultEndpoint), "websocket endpoint")
+	flag.StringVar(&c.dbPath, "db", env("MDP_DB", "data/mdp.db"), "SQLite database path")
+	flag.StringVar(&c.httpAddr, "http", defaultHTTPAddr(), "HTTP listen address; empty disables the API")
 	flag.DurationVar(&c.duration, "duration", 0, "exit after this long; 0 runs until interrupted")
-	flag.StringVar(&c.durability, "durability", "normal", "sqlite fsync policy: full|normal|off")
+	flag.StringVar(&c.durability, "durability", env("MDP_DURABILITY", "normal"), "sqlite fsync policy: full|normal|off")
 	flag.IntVar(&c.batchSize, "batch", 500, "ticks per storage transaction")
 	flag.DurationVar(&c.flushEvery, "flush", 250*time.Millisecond, "max time a tick waits before being written")
-	flag.DurationVar(&c.candleEvery, "candle-interval", time.Minute, "OHLCV bar size")
-	flag.BoolVar(&c.storeRaw, "store-raw", true, "also persist undecoded exchange frames")
-	flag.StringVar(&c.logLevel, "log-level", "info", "debug|info|warn|error")
+	flag.DurationVar(&c.candleEvery, "candle-interval", envDur("MDP_CANDLE_INTERVAL", time.Minute), "OHLCV bar size")
+	flag.BoolVar(&c.storeRaw, "store-raw", envBool("MDP_STORE_RAW", true), "also persist undecoded exchange frames")
+	flag.StringVar(&c.logLevel, "log-level", env("MDP_LOG_LEVEL", "info"), "debug|info|warn|error")
 	flag.DurationVar(&c.pingInterval, "ping-interval", 20*time.Second, "venue liveness probe; 0 disables")
 
-	flag.BoolVar(&c.paperEnabled, "paper", false, "enable paper trading")
-	flag.Float64Var(&c.paperCash, "paper-cash", 10000, "starting balance in quote currency")
-	flag.Float64Var(&c.feeRate, "paper-fee", 0.001, "fee per fill as a fraction of notional")
-	flag.Float64Var(&c.slippage, "paper-slippage", 0.0005, "spread crossed per fill")
-	flag.Float64Var(&c.maxPosition, "paper-max-position", 0.25, "max fraction of equity per position")
-	flag.StringVar(&c.strategyName, "strategy", "momentum", "momentum|llm|llm+momentum")
-	flag.DurationVar(&c.evalEvery, "eval-interval", 60*time.Second, "how often the strategy runs")
+	flag.BoolVar(&c.paperEnabled, "paper", envBool("MDP_PAPER", false), "enable paper trading")
+	flag.Float64Var(&c.paperCash, "paper-cash", envFloat("MDP_PAPER_CASH", 10000), "starting balance in quote currency")
+	flag.Float64Var(&c.feeRate, "paper-fee", envFloat("MDP_PAPER_FEE", 0.001), "fee per fill as a fraction of notional")
+	flag.Float64Var(&c.slippage, "paper-slippage", envFloat("MDP_PAPER_SLIPPAGE", 0.0005), "spread crossed per fill")
+	flag.Float64Var(&c.maxPosition, "paper-max-position", envFloat("MDP_PAPER_MAX_POSITION", 0.25), "max fraction of equity per position")
+	flag.StringVar(&c.strategyName, "strategy", env("MDP_STRATEGY", "momentum"), "comma-separated: momentum, meanrev, llm, llm+momentum — each runs its own independent account")
+	flag.DurationVar(&c.evalEvery, "eval-interval", envDur("MDP_EVAL_INTERVAL", 60*time.Second), "how often each strategy runs")
 	flag.DurationVar(&c.fillLatency, "fill-latency", 500*time.Millisecond, "simulated execution delay")
-	flag.StringVar(&c.paperState, "paper-state", "data/paper.json", "where the paper book is persisted")
-	flag.StringVar(&c.llmModel, "llm-model", "", "override the Claude model ID")
+	flag.StringVar(&c.paperState, "paper-state", env("MDP_PAPER_STATE", "data/paper.json"), "path prefix for persisted paper books")
+	flag.StringVar(&c.llmModel, "llm-model", env("MDP_LLM_MODEL", ""), "override the Claude model ID")
+	flag.DurationVar(&c.retainTicks, "retain-ticks", envDur("MDP_RETAIN_TICKS", 0), "delete ticks older than this; 0 keeps forever")
+	flag.DurationVar(&c.retainRaw, "retain-raw", envDur("MDP_RETAIN_RAW", 24*time.Hour), "delete raw frames older than this; 0 keeps forever")
+	flag.Int64Var(&c.maxDBBytes, "max-db-bytes", int64(envInt("MDP_MAX_DB_BYTES", 0)), "hard archive size cap; oldest days are dropped to stay under it. 0 disables")
+	flag.DurationVar(&c.retainEvery, "retention-interval", envDur("MDP_RETENTION_INTERVAL", time.Hour), "how often retention runs")
+	flag.BoolVar(&c.vacuumOnStart, "vacuum-on-start", envBool("MDP_VACUUM_ON_START", false), "rebuild the database at startup so pruning can reclaim space (slow on a large archive)")
 	flag.Parse()
 
 	log := newLogger(c.logLevel)
@@ -127,6 +199,18 @@ func run() error {
 		return err
 	}
 	defer db.Close()
+
+	if stale, err := db.NeedsVacuum(ctx); err == nil && stale {
+		if c.vacuumOnStart {
+			log.Info("vacuuming: adopting incremental auto-vacuum (this rewrites the file)")
+			if err := db.Vacuum(ctx); err != nil {
+				return err
+			}
+		} else {
+			log.Warn("this database predates incremental auto-vacuum, so pruning will " +
+				"delete rows without shrinking the file; restart once with -vacuum-on-start to fix it")
+		}
+	}
 
 	src := binance.New(registry, clock,
 		binance.WithEndpoint(c.endpoint),
@@ -180,47 +264,85 @@ func run() error {
 	}
 	g.Go(func() error { return builder.Run(ctx, candleSub) })
 
-	var engine *paper.Engine
+	var engines []*paper.Engine
 	if c.paperEnabled {
-		strat, err := buildStrategy(c, log)
+		names, err := parseStrategies(c.strategyName)
 		if err != nil {
 			return err
 		}
 
-		acct := paper.NewAccount(paper.Config{
-			StartingCash:        model.FromFloat(c.paperCash, 2),
-			FeeRate:             c.feeRate,
-			SlippageRate:        c.slippage,
-			MaxPositionFraction: c.maxPosition,
-		}, log)
+		// Each strategy gets its own account, its own bus subscription, and
+		// its own state file, all fed from the identical tick stream. That
+		// is the only way a month-long comparison means anything: same data,
+		// same costs, same latency — the only variable is the decision rule.
+		for _, name := range names {
+			strat, err := buildStrategy(name, c, log)
+			if err != nil {
+				return err
+			}
 
-		engine = paper.NewEngine(paper.EngineConfig{
-			EvalInterval: c.evalEvery,
-			FillLatency:  c.fillLatency,
-			StatePath:    c.paperState,
-		}, acct, strat, builder, binance.ID, instruments, log)
+			acct := paper.NewAccount(paper.Config{
+				StartingCash:        model.FromFloat(c.paperCash, 2),
+				FeeRate:             c.feeRate,
+				SlippageRate:        c.slippage,
+				MaxPositionFraction: c.maxPosition,
+			}, log.With("strategy", name))
 
-		// The strategy only needs current prices, so it conflates: one tick
-		// per instrument is all it can act on anyway.
-		paperSub, err := b.Subscribe(bus.SubscriberSpec{
-			Name: "paper", Capacity: 1024, Policy: bus.PolicyCoalesce,
-		})
-		if err != nil {
-			return err
+			engine := paper.NewEngine(paper.EngineConfig{
+				Name:         name,
+				EvalInterval: c.evalEvery,
+				FillLatency:  c.fillLatency,
+				StatePath:    statePathFor(c.paperState, name),
+			}, acct, strat, builder, binance.ID, instruments, log.With("strategy", name))
+
+			sub, err := b.Subscribe(bus.SubscriberSpec{
+				Name: "paper-" + name, Capacity: 1024, Policy: bus.PolicyCoalesce,
+			})
+			if err != nil {
+				return err
+			}
+			g.Go(func() error { return engine.Run(ctx, sub) })
+			engines = append(engines, engine)
+
+			log.Info("paper account started",
+				"strategy", strat.Name(), "cash", c.paperCash,
+				"state", statePathFor(c.paperState, name))
+
+			// An LLM strategy bills per evaluation, so the eval interval is
+			// a spending control, not just a tuning knob. At the 60s default
+			// that is ~43,000 calls a month — enough to be a genuinely
+			// unpleasant surprise, so say the number out loud at startup
+			// rather than letting it accumulate silently.
+			if strings.HasPrefix(name, "llm") {
+				perMonth := int(30 * 24 * time.Hour / c.evalEvery)
+				level := log.Info
+				if c.evalEvery < 5*time.Minute {
+					level = log.Warn
+				}
+				level("llm strategy bills per evaluation",
+					"eval_interval", c.evalEvery,
+					"calls_per_month", perMonth,
+					"note", "raise -eval-interval or use a cheaper -llm-model to cut this")
+			}
 		}
-		g.Go(func() error { return engine.Run(ctx, paperSub) })
-
-		log.Info("paper trading enabled",
-			"strategy", strat.Name(), "cash", c.paperCash,
-			"fee_rate", c.feeRate, "eval_interval", c.evalEvery)
 	}
+
+	// Retention. On a fixed-size volume this is what decides whether the run
+	// reaches day 30 or dies with a full disk somewhere around day nine.
+	janitor := store.NewJanitor(db, store.RetentionConfig{
+		Ticks:    c.retainTicks,
+		Raw:      c.retainRaw,
+		MaxBytes: c.maxDBBytes,
+		Interval: c.retainEvery,
+	}, log)
+	g.Go(func() error { return janitor.Run(ctx) })
 
 	if c.httpAddr != "" {
 		ws := wsapi.New(b, log)
 		g.Go(func() error { return ws.Run(ctx) })
 
 		api := httpapi.New(httpapi.Deps{
-			Store: db, Bus: b, Candles: builder, Paper: engine,
+			Store: db, Bus: b, Candles: builder, Paper: engines,
 			Persister: persister, Venue: binance.ID,
 			Instruments: instruments, StartedAt: startedAt, Log: log,
 		})
@@ -241,9 +363,10 @@ func run() error {
 		err = nil
 	}
 
-	if engine != nil {
-		snap := engine.Account().Snapshot(time.Now().UTC())
+	for _, e := range engines {
+		snap := e.Account().Snapshot(time.Now().UTC())
 		log.Info("final paper result",
+			"strategy", e.Name(),
 			"equity", snap.Equity.String(), "total_pl", snap.TotalPL.String(),
 			"return_pct", fmt.Sprintf("%.2f", snap.ReturnPct),
 			"trades", snap.Trades, "wins", snap.Wins, "losses", snap.Losses,
@@ -327,12 +450,43 @@ func pump(
 	}
 }
 
-func buildStrategy(c config, log *slog.Logger) (strategy.Strategy, error) {
+// parseStrategies splits and validates the comma-separated strategy list.
+func parseStrategies(raw string) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range strings.Split(raw, ",") {
+		f = strings.ToLower(strings.TrimSpace(f))
+		if f == "" {
+			continue
+		}
+		if seen[f] {
+			return nil, fmt.Errorf("strategy %q listed twice; each needs a distinct account", f)
+		}
+		seen[f] = true
+		out = append(out, f)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no strategies requested")
+	}
+	return out, nil
+}
+
+// statePathFor gives each strategy its own book file, derived from the
+// configured path so a single volume mount covers all of them.
+func statePathFor(base, name string) string {
+	ext := filepath.Ext(base)
+	return strings.TrimSuffix(base, ext) + "-" + name + ext
+}
+
+func buildStrategy(name string, c config, log *slog.Logger) (strategy.Strategy, error) {
 	momentum := strategy.NewMomentum(9, 27)
 
-	switch strings.ToLower(c.strategyName) {
+	switch name {
 	case "", "momentum":
 		return momentum, nil
+
+	case "meanrev":
+		return strategy.NewMeanReversion(30, 2.0, 0.5), nil
 
 	case "llm":
 		if os.Getenv("ANTHROPIC_API_KEY") == "" {
@@ -350,7 +504,7 @@ func buildStrategy(c config, log *slog.Logger) (strategy.Strategy, error) {
 		}, log), nil
 
 	default:
-		return nil, fmt.Errorf("unknown strategy %q", c.strategyName)
+		return nil, fmt.Errorf("unknown strategy %q (want momentum, meanrev, llm, or llm+momentum)", name)
 	}
 }
 
