@@ -4,6 +4,10 @@ The fastest path to seeing it work, then the path to a real month-long run.
 Everything here uses fake or paper money — nothing in this guide can lose
 real funds.
 
+**Just want to upload it and have it running, no local setup?** Skip to
+[Deploy straight to Railway](#deploy-straight-to-railway) below — it's a
+GitHub-connect and four env vars, no `go run` required.
+
 ## 0. Install Go
 
 ```sh
@@ -128,17 +132,39 @@ flags — see the README's *Real orders* section before you ever go near
 
 ---
 
-## 5. Deploy for a real month-long run
+## 5. Deploy straight to Railway
 
-Local `go run` stops when your laptop sleeps. For an actual month, it needs
-to live somewhere that stays on. You mentioned Railway:
+No local Go, no terminal commands on your machine at all — Railway builds
+the repo's Dockerfile and runs it. This is the "upload it and it's running"
+path.
 
-1. Push this repo to your own GitHub (or use this one directly)
-2. [railway.app](https://railway.app) → New Project → Deploy from GitHub repo
-3. **Attach a Volume, mounted at `/data`.** This is the step that's easy to
-   skip and ruins everything if you do — without it, every redeploy wipes
-   your archive and paper accounts and the month silently restarts at zero.
-4. Set environment variables (Settings → Variables):
+**Step 1 — get the code into your own GitHub**, so Railway has something to
+deploy from:
+
+- Easiest: on this repo's GitHub page, click **Fork** (top right) to get
+  your own copy under your account.
+- Or if you already cloned it locally, push it to a new repo of yours:
+  `git remote add mine https://github.com/<you>/<name>.git && git push mine claude/market-data-pipeline-1amxx1:main`
+
+**Step 2 — connect it to Railway:**
+
+1. [railway.app](https://railway.app) → **New Project** → **Deploy from
+   GitHub repo** → pick your fork.
+2. Railway detects the `Dockerfile` and `railway.json` in the repo
+   automatically — nothing to configure there. It'll try to build and
+   deploy immediately; that first deploy will come up but with an empty
+   archive on ephemeral storage, which step 3 fixes.
+
+**Step 3 — attach a Volume.** This is the one step that's easy to skip and
+ruins everything if you do: without it, every redeploy wipes the archive
+*and* the paper trading accounts, and a month-long run silently restarts
+from zero each time you push a change.
+
+In the service → **Settings** → **Volumes** → **New Volume** → mount path
+`/data`. Takes 30 seconds.
+
+**Step 4 — set the trading config.** Service → **Variables** → **Raw
+Editor**, paste:
 
 ```
 MDP_PAPER=true
@@ -149,19 +175,31 @@ MDP_RETAIN_TICKS=336h
 MDP_MAX_DB_BYTES=8000000000
 ```
 
-Add `ANTHROPIC_API_KEY` if you're running `llm`, or `ALPACA_API_KEY` /
-`ALPACA_API_SECRET` if you're running `-alpaca` (also add `-alpaca` and
-`-alpaca-strategy` to the start command in that case).
+That's the whole thing — momentum and mean-reversion trading fake money
+side by side, real BTC/ETH/SOL prices, sized retention so a small volume
+doesn't fill up over a month. `PORT` is handled automatically; don't set it.
 
-5. Deploy. Railway builds the Dockerfile and starts it — no other config
-   needed, `PORT` is picked up automatically.
+Optional additions to the same variable block:
+- `ANTHROPIC_API_KEY=sk-ant-...` plus changing `MDP_STRATEGY` to include
+  `llm` — see step 3 above for why you also want `MDP_EVAL_INTERVAL=15m` if
+  you do this.
+- `ALPACA_API_KEY` / `ALPACA_API_SECRET` for real paper-account orders — see
+  step 4 above; also add `MDP_ALPACA=true` and `MDP_ALPACA_STRATEGY=momentum`
+  to the variables.
 
-Check it's alive:
+**Step 5 — save.** Railway redeploys automatically whenever you change a
+variable or push to the branch. Watch the **Deployments** tab; once it says
+healthy, you're live.
+
+Check it from anywhere:
 
 ```sh
 curl -s https://<your-app>.up.railway.app/healthz
 curl -s https://<your-app>.up.railway.app/v1/paper | jq .
 ```
+
+(Railway gives you that `.up.railway.app` URL under **Settings** →
+**Networking** → **Generate Domain**, if it isn't already showing one.)
 
 Full sizing tables, retention tuning, and LLM cost breakdown are in the
 [README](README.md#deploying-to-railway).
