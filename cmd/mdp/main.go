@@ -98,6 +98,7 @@ type config struct {
 
 	equityAutoEnabled bool
 	equitySymbols     string
+	equityStrategy    string
 	equityPollEvery   time.Duration
 	equityEvalEvery   time.Duration
 	equityMaxPosition float64
@@ -206,6 +207,7 @@ func run() error {
 
 	flag.BoolVar(&c.equityAutoEnabled, "equity-auto", envBool("MDP_EQUITY_AUTO", false), "automatically trade a basket of stocks through Alpaca using the adaptive bandit strategy (needs ALPACA_API_KEY, ALPACA_API_SECRET)")
 	flag.StringVar(&c.equitySymbols, "equity-symbols", env("MDP_EQUITY_SYMBOLS", "AAPL,MSFT,NVDA,TSLA,AMD,META,AMZN,GOOGL,NFLX,COIN"), "comma-separated stock tickers to trade")
+	flag.StringVar(&c.equityStrategy, "equity-strategy", env("MDP_EQUITY_STRATEGY", "adaptive"), "adaptive, llm, or llm+adaptive (llm variants need ANTHROPIC_API_KEY) — which decision rule drives the stock basket")
 	flag.DurationVar(&c.equityPollEvery, "equity-poll-interval", envDur("MDP_EQUITY_POLL_INTERVAL", 30*time.Second), "how often each symbol's quote is sampled into this engine's own price history")
 	flag.DurationVar(&c.equityEvalEvery, "equity-eval-interval", envDur("MDP_EQUITY_EVAL_INTERVAL", 60*time.Second), "how often the strategy runs across the basket")
 	flag.Float64Var(&c.equityMaxPosition, "equity-max-position", envFloat("MDP_EQUITY_MAX_POSITION", 0.05), "max fraction of account equity per stock position — kept small since several can be held at once")
@@ -659,6 +661,28 @@ func wireEquityAuto(ctx context.Context, c config, log *slog.Logger, g *errgroup
 		return errors.New("-equity-auto requires ALPACA_API_KEY and ALPACA_API_SECRET")
 	}
 
+	// Resolve the strategy before touching the network at all — an
+	// -equity-strategy typo or a missing ANTHROPIC_API_KEY should fail
+	// immediately, not after an Alpaca round trip that was going to be
+	// thrown away anyway.
+	var strat strategy.Strategy
+	var err error
+	switch c.equityStrategy {
+	case "", "adaptive":
+		// Faster-tuned than buildStrategy's generic default: shorter arms
+		// and a higher exploration rate, since this engine is explicitly
+		// meant to trade often across a basket rather than sit on one
+		// long-lived call.
+		strat = strategy.NewAdaptive([]strategy.AdaptiveArm{
+			{Fast: 1, Slow: 3}, {Fast: 2, Slow: 5}, {Fast: 3, Slow: 8}, {Fast: 5, Slow: 13},
+		}, 0.2, 0.6)
+	default:
+		strat, err = buildStrategy(c.equityStrategy, c, log)
+		if err != nil {
+			return fmt.Errorf("-equity-strategy: %w", err)
+		}
+	}
+
 	symbols := strings.Split(c.equitySymbols, ",")
 	for i := range symbols {
 		symbols[i] = strings.ToUpper(strings.TrimSpace(symbols[i]))
@@ -680,12 +704,20 @@ func wireEquityAuto(ctx context.Context, c config, log *slog.Logger, g *errgroup
 		return fmt.Errorf("equity-auto: alpaca startup check failed: %w", err)
 	}
 
-	// A faster-tuned bandit than the crypto side's default: shorter arms and
-	// a higher exploration rate, since this engine is explicitly meant to
-	// trade often across a basket rather than sit on one long-lived call.
-	strat := strategy.NewAdaptive([]strategy.AdaptiveArm{
-		{Fast: 1, Slow: 3}, {Fast: 2, Slow: 5}, {Fast: 3, Slow: 8}, {Fast: 5, Slow: 13},
-	}, 0.2, 0.6)
+	// Same reasoning as the paper-trading loop's identical check: an LLM
+	// strategy bills per evaluation, so the eval interval is a spending
+	// control here too, not just a tuning knob.
+	if strings.HasPrefix(c.equityStrategy, "llm") {
+		perMonth := int(30 * 24 * time.Hour / c.equityEvalEvery)
+		level := log.Info
+		if c.equityEvalEvery < 5*time.Minute {
+			level = log.Warn
+		}
+		level("equity-auto llm strategy bills per evaluation",
+			"eval_interval", c.equityEvalEvery,
+			"calls_per_month", perMonth,
+			"note", "raise -equity-eval-interval or use a cheaper -llm-model to cut this")
+	}
 
 	engine := equitytrader.NewEngine(equitytrader.Config{
 		Symbols:             symbols,
@@ -731,8 +763,22 @@ func buildStrategy(name string, c config, log *slog.Logger) (strategy.Strategy, 
 			Baseline: momentum,
 		}, log), nil
 
+	case "llm+adaptive":
+		if os.Getenv("ANTHROPIC_API_KEY") == "" {
+			return nil, errors.New("strategy=llm+adaptive requires ANTHROPIC_API_KEY")
+		}
+		// The model sees the bandit's own signals as a reference opinion in
+		// its prompt (see LLM.buildPrompt) — it can agree, disagree, or
+		// override, but the bandit's arms keep learning independently of
+		// whatever the model decides. Two differently-wrong opinions on the
+		// same data, not one strategy deferring to the other.
+		return strategy.NewLLM(strategy.LLMConfig{
+			Model:    c.llmModel,
+			Baseline: strategy.NewAdaptive(nil, 0, 0),
+		}, log), nil
+
 	default:
-		return nil, fmt.Errorf("unknown strategy %q (want adaptive, momentum, meanrev, llm, or llm+momentum)", name)
+		return nil, fmt.Errorf("unknown strategy %q (want adaptive, momentum, meanrev, llm, llm+momentum, or llm+adaptive)", name)
 	}
 }
 

@@ -181,6 +181,13 @@ movement, not a fixed schedule. Watch for `"equity fill"` in the log. See
 the README's *Automatic stock trading* section before raising
 `-equity-max-position` or pointing it anywhere but the paper endpoint.
 
+Want Claude weighing in on each decision instead of (or alongside) the
+mechanical bandit? Add `ANTHROPIC_API_KEY` and:
+
+```sh
+go run ./cmd/mdp -equity-auto -equity-strategy llm+adaptive
+```
+
 ---
 
 ## 7. Deploy straight to Railway
@@ -241,7 +248,9 @@ Optional additions to the same variable block:
   `ALPACA_API_SECRET` above) for the Telegram bot from step 5 — also add
   `MDP_TELEGRAM=true`.
 - The same `ALPACA_API_KEY` / `ALPACA_API_SECRET` again plus
-  `MDP_EQUITY_AUTO=true` for the automatic stock basket from step 6.
+  `MDP_EQUITY_AUTO=true` for the automatic stock basket from step 6 — add
+  `MDP_EQUITY_STRATEGY=llm+adaptive` and `ANTHROPIC_API_KEY` too if you want
+  Claude driving those decisions.
 
 **Step 5 — save.** Railway redeploys automatically whenever you change a
 variable or push to the branch. Watch the **Deployments** tab; once it says

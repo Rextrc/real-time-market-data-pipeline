@@ -298,6 +298,7 @@ go run ./cmd/mdp -equity-auto
 |---|---|---|
 | `-equity-auto` | off | enable it |
 | `-equity-symbols` | `AAPL,MSFT,NVDA,TSLA,AMD,META,AMZN,GOOGL,NFLX,COIN` | the traded basket |
+| `-equity-strategy` | `adaptive` | `adaptive`, `llm`, or `llm+adaptive` — see below |
 | `-equity-poll-interval` | `30s` | how often each symbol's quote is sampled |
 | `-equity-eval-interval` | `60s` | how often the strategy runs across the basket |
 | `-equity-max-position` | `0.05` | max fraction of equity per stock position — smaller than the crypto default since several can be held at once |
@@ -306,10 +307,30 @@ There is no live stock tick stream elsewhere in this system — the crypto
 pipeline is fed by Binance's websocket, and building a second one just for a
 stock basket wasn't worth it here. Instead this engine polls Alpaca's quote
 endpoint on a timer and builds its own short price history from that, which
-it feeds to a bandit strategy (the same `Adaptive` used elsewhere) tuned
-faster than the crypto default — shorter arms (down to 1/3), higher
-exploration — since the point of this engine specifically is to trade often
-across several symbols rather than sit on one long-lived call.
+it feeds to whichever `strategy.Strategy` you pick — the `Market` interface
+doesn't care whether the price history came from a websocket or a poll loop.
+
+**`-equity-strategy adaptive`** (default) is the same bandit used elsewhere,
+tuned faster: shorter arms (down to 1/3), higher exploration, since the
+point of this engine specifically is to trade often across several symbols
+rather than sit on one long-lived call.
+
+**`-equity-strategy llm+adaptive`** puts Claude in the loop: needs
+`ANTHROPIC_API_KEY`. Each evaluation, the model sees recent price history
+for every symbol plus the bandit's own signals as a reference opinion, and
+decides independently — same `strategy.LLM` used by the crypto side's `llm`
+strategies, same honesty applies (see *Strategies* above: it's a legible,
+readable-reasoning opinion, not a forecaster, and the honest prior is that
+it underperforms the mechanical rule after fees). The bandit keeps learning
+from its own trades regardless of what the model decides — this runs two
+differently-wrong opinions side by side, not one deferring to the other.
+`-equity-strategy llm` skips the bandit reference entirely if you want the
+model's calls unprompted by a mechanical baseline.
+
+Since an LLM strategy bills per evaluation, watch `-equity-eval-interval`
+the same way you would `-eval-interval` for the crypto side — the startup
+log prints an estimated monthly call count and warns if the interval is
+under 5 minutes.
 
 **Be honest with yourself about "trade often."** How many trades an hour
 actually happen depends on real price movement, not a schedule — this

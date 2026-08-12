@@ -81,8 +81,10 @@ func NewLLM(cfg LLMConfig, log *slog.Logger) *LLM {
 
 func (l *LLM) Name() string { return "llm(" + l.modelID + ")" }
 
-const llmSystemPrompt = `You are evaluating short-term crypto price action for a
-simulated (paper) trading account. No real money is at stake.
+const llmSystemPrompt = `You are evaluating short-term price action (crypto or
+equities — check the instrument names) for a trading account. Positions may
+be real orders against a broker's paper-trading account; treat every
+decision as if it matters.
 
 You will receive recent OHLCV candles for one or more instruments, plus the
 account's current positions.
