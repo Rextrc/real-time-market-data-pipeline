@@ -25,9 +25,11 @@ import (
 
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/api/httpapi"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/api/wsapi"
+	"github.com/Rextrc/real-time-market-data-pipeline/internal/broker/alpaca"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/bus"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/bus/inproc"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/consumer/candles"
+	livebroker "github.com/Rextrc/real-time-market-data-pipeline/internal/consumer/live"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/consumer/paper"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/consumer/persist"
 	"github.com/Rextrc/real-time-market-data-pipeline/internal/instrument"
@@ -79,6 +81,13 @@ type config struct {
 	maxDBBytes    int64
 	retainEvery   time.Duration
 	vacuumOnStart bool
+
+	alpacaEnabled     bool
+	alpacaStrategy    string
+	alpacaBaseURL     string
+	alpacaAllowLive   bool
+	alpacaMaxPosition float64
+	alpacaEvalEvery   time.Duration
 }
 
 // env reads a configuration value from the environment, falling back to a
@@ -169,6 +178,13 @@ func run() error {
 	flag.Int64Var(&c.maxDBBytes, "max-db-bytes", int64(envInt("MDP_MAX_DB_BYTES", 0)), "hard archive size cap; oldest days are dropped to stay under it. 0 disables")
 	flag.DurationVar(&c.retainEvery, "retention-interval", envDur("MDP_RETENTION_INTERVAL", time.Hour), "how often retention runs")
 	flag.BoolVar(&c.vacuumOnStart, "vacuum-on-start", envBool("MDP_VACUUM_ON_START", false), "rebuild the database at startup so pruning can reclaim space (slow on a large archive)")
+
+	flag.BoolVar(&c.alpacaEnabled, "alpaca", envBool("MDP_ALPACA", false), "execute one strategy's signals as real orders against Alpaca's PAPER trading API")
+	flag.StringVar(&c.alpacaStrategy, "alpaca-strategy", env("MDP_ALPACA_STRATEGY", "momentum"), "which -strategy this engine drives (must be one already listed there)")
+	flag.StringVar(&c.alpacaBaseURL, "alpaca-base-url", env("MDP_ALPACA_BASE_URL", alpaca.PaperBaseURL), "Alpaca API base URL; changing this away from the paper endpoint also requires -alpaca-allow-live")
+	flag.BoolVar(&c.alpacaAllowLive, "alpaca-allow-live", envBool("MDP_ALPACA_ALLOW_LIVE", false), "required in addition to a non-paper -alpaca-base-url before any real-money order can be sent")
+	flag.Float64Var(&c.alpacaMaxPosition, "alpaca-max-position", envFloat("MDP_ALPACA_MAX_POSITION", 0.1), "max fraction of account equity per Alpaca position")
+	flag.DurationVar(&c.alpacaEvalEvery, "alpaca-eval-interval", envDur("MDP_ALPACA_EVAL_INTERVAL", 5*time.Minute), "how often the Alpaca engine evaluates and can trade")
 	flag.Parse()
 
 	log := newLogger(c.logLevel)
@@ -327,6 +343,12 @@ func run() error {
 		}
 	}
 
+	if c.alpacaEnabled {
+		if err := wireAlpaca(ctx, c, b, builder, instruments, log, g); err != nil {
+			return err
+		}
+	}
+
 	// Retention. On a fixed-size volume this is what decides whether the run
 	// reaches day 30 or dies with a full disk somewhere around day nine.
 	janitor := store.NewJanitor(db, store.RetentionConfig{
@@ -476,6 +498,69 @@ func parseStrategies(raw string) ([]string, error) {
 func statePathFor(base, name string) string {
 	ext := filepath.Ext(base)
 	return strings.TrimSuffix(base, ext) + "-" + name + ext
+}
+
+// wireAlpaca connects a real Alpaca paper-trading engine driving one named
+// strategy. Kept separate from the main wiring block because it has its own
+// credential requirements and its own safety interlock (see
+// internal/broker/alpaca), and a reader should be able to see the whole
+// live-money-adjacent path in one place rather than interleaved with the
+// simulated-trading wiring above it.
+func wireAlpaca(
+	ctx context.Context,
+	c config,
+	b bus.Bus,
+	builder *candles.Builder,
+	instruments []model.InstrumentID,
+	log *slog.Logger,
+	g *errgroup.Group,
+) error {
+	key := os.Getenv("ALPACA_API_KEY")
+	secret := os.Getenv("ALPACA_API_SECRET")
+	if key == "" || secret == "" {
+		return errors.New("-alpaca requires ALPACA_API_KEY and ALPACA_API_SECRET")
+	}
+
+	strat, err := buildStrategy(c.alpacaStrategy, c, log)
+	if err != nil {
+		return fmt.Errorf("-alpaca-strategy: %w", err)
+	}
+
+	registry := instrument.NewRegistry()
+	if err := registry.Register(binance.Symbols()...); err != nil {
+		return err
+	}
+
+	client, err := alpaca.New(alpaca.Config{
+		APIKey: key, APISecret: secret,
+		BaseURL: c.alpacaBaseURL, AllowLive: c.alpacaAllowLive,
+	}, registry, log.With("broker", "alpaca"))
+	if err != nil {
+		return err
+	}
+
+	if err := client.Ping(ctx); err != nil {
+		return fmt.Errorf("alpaca: startup check failed: %w", err)
+	}
+
+	engine := livebroker.NewEngine(livebroker.Config{
+		Name:                "alpaca-" + c.alpacaStrategy,
+		EvalInterval:        c.alpacaEvalEvery,
+		MaxPositionFraction: c.alpacaMaxPosition,
+	}, client, strat, builder, binance.ID, instruments, log.With("engine", "alpaca"))
+
+	sub, err := b.Subscribe(bus.SubscriberSpec{
+		Name: "alpaca-" + c.alpacaStrategy, Capacity: 1024, Policy: bus.PolicyCoalesce,
+	})
+	if err != nil {
+		return err
+	}
+	g.Go(func() error { return engine.Run(ctx, sub) })
+
+	log.Warn("ALPACA EXECUTION ENABLED — this engine submits real orders",
+		"broker", client.Name(), "strategy", strat.Name(),
+		"max_position_fraction", c.alpacaMaxPosition, "eval_interval", c.alpacaEvalEvery)
+	return nil
 }
 
 func buildStrategy(name string, c config, log *slog.Logger) (strategy.Strategy, error) {

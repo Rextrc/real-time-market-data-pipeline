@@ -131,6 +131,71 @@ running this unattended.
 
 ---
 
+## Real orders: Alpaca paper trading
+
+Everything above is simulated. This is not — it drives one strategy's
+signals into Alpaca's actual paper-trading account: a real Alpaca account
+with fake money, real order acceptance and rejection, real fills reported by
+Alpaca itself. It is a step up in realism from the built-in paper engine, not
+a replacement for it, and it needs Alpaca API keys.
+
+```sh
+export ALPACA_API_KEY=...
+export ALPACA_API_SECRET=...
+go run ./cmd/mdp -paper -strategy momentum,meanrev \
+  -alpaca -alpaca-strategy momentum -alpaca-eval-interval 5m
+```
+
+`-alpaca-strategy` names one of the strategies already listed in `-strategy`
+and gives it a second, real execution path alongside its simulated one — so
+you can watch the same decisions play out in both an in-process book and a
+real Alpaca account, side by side.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-alpaca` | off | enable real order execution |
+| `-alpaca-strategy` | `momentum` | which strategy drives it |
+| `-alpaca-max-position` | `0.1` | max fraction of Alpaca account equity per order — enforced here, independent of the strategy and of whatever Alpaca itself would allow |
+| `-alpaca-eval-interval` | `5m` | how often it can trade; also the ceiling on order frequency |
+| `-alpaca-base-url` | Alpaca's paper endpoint | see below |
+| `-alpaca-allow-live` | off | see below |
+
+### The one interlock that matters here
+
+The Alpaca SDK this is built on **defaults to the live endpoint** when none
+is configured — not paper. That default is inverted in this codebase:
+`New` defaults to paper and a non-paper URL is refused unless
+`-alpaca-allow-live` is also set, and even then only Alpaca's actual live
+host is accepted — the flag grants "trade for real on Alpaca," not "trust
+any URL." No environment variable or typo can flip this on its own; reaching
+live money requires two separate, explicit settings agreeing.
+
+```
+go: unrecognized alpaca error: alpaca: a non-paper base URL was given but
+AllowLive is not set; this package defaults to Alpaca's paper endpoint and
+requires an explicit opt-in to reach anything else
+```
+
+is the interlock working as intended, not a bug to route around.
+
+### What "paper" means here, and what it doesn't fix
+
+Alpaca's paper environment is a real account with simulated fills — real
+order acceptance/rejection semantics, real position and cash tracking, no
+local guesswork about slippage. It is **not** free of the risks that make
+automated trading risky in the first place:
+
+- **Crypto never closes.** There is no market-hours boundary to stop trading
+  while you're asleep or the process is mid-redeploy. `-alpaca-eval-interval`
+  is the only throttle — keep it conservative.
+- **A bug in the strategy is now a bug with consequences**, even against
+  fake money: a runaway buy loop would exhaust the paper account exactly as
+  it would a real one. `-alpaca-max-position` is what limits the damage.
+- **This does not become live trading by editing a flag.** It requires the
+  interlock above, on purpose.
+
+---
+
 ## Backpressure — the part worth understanding
 
 Every consumer gets **its own queue** and declares **its own policy**. Sharing
