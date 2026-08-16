@@ -169,7 +169,7 @@ a replacement for it, and it needs Alpaca API keys.
 export ALPACA_API_KEY=...
 export ALPACA_API_SECRET=...
 go run ./cmd/mdp -paper -strategy adaptive,momentum,meanrev \
-  -alpaca -alpaca-strategy adaptive -alpaca-eval-interval 2m
+  -alpaca -alpaca-strategy adaptive -alpaca-eval-interval 5m
 ```
 
 `-alpaca-strategy` builds a second, independent instance of one of the
@@ -183,7 +183,7 @@ have to also appear in `-strategy`; it's fine to run it live-only.
 | `-alpaca` | off | enable real order execution |
 | `-alpaca-strategy` | `adaptive` | which strategy drives it |
 | `-alpaca-max-position` | `0.1` | max fraction of Alpaca account equity per order — enforced here, independent of the strategy and of whatever Alpaca itself would allow |
-| `-alpaca-eval-interval` | `2m` | how often it can trade; also the ceiling on order frequency |
+| `-alpaca-eval-interval` | `5m` | how often it can trade; also the ceiling on order frequency |
 | `-alpaca-base-url` | Alpaca's paper endpoint | see below |
 | `-alpaca-allow-live` | off | see below |
 
@@ -299,9 +299,9 @@ go run ./cmd/mdp -equity-auto
 | `-equity-auto` | off | enable it |
 | `-equity-symbols` | `AAPL,MSFT,NVDA,TSLA,AMD,META,AMZN,GOOGL,NFLX,COIN` | the traded basket |
 | `-equity-strategy` | `adaptive` | `adaptive`, `llm`, or `llm+adaptive` — see below |
-| `-equity-poll-interval` | `30s` | how often each symbol's quote is sampled |
-| `-equity-eval-interval` | `60s` | how often the strategy runs across the basket |
-| `-equity-max-position` | `0.05` | max fraction of equity per stock position — smaller than the crypto default since several can be held at once |
+| `-equity-poll-interval` | `1m` | how often each symbol's quote is sampled |
+| `-equity-eval-interval` | `5m` | how often the strategy runs across the basket |
+| `-equity-max-position` | `0.03` | max fraction of equity per stock position — smaller than the crypto default since several can be held at once |
 
 There is no live stock tick stream elsewhere in this system — the crypto
 pipeline is fed by Binance's websocket, and building a second one just for a
@@ -311,9 +311,13 @@ it feeds to whichever `strategy.Strategy` you pick — the `Market` interface
 doesn't care whether the price history came from a websocket or a poll loop.
 
 **`-equity-strategy adaptive`** (default) is the same bandit used elsewhere,
-tuned faster: shorter arms (down to 1/3), higher exploration, since the
-point of this engine specifically is to trade often across several symbols
-rather than sit on one long-lived call.
+with slightly shorter arms (3/9 up to 13/34) than the crypto side's default
+so it still trades more often across a wider basket — but no longer the
+fastest possible setup. It started at 1/3, genuinely trading many times an
+hour; the honest result of that was flipping on noise and paying the
+bid-ask spread on every round trip with no real edge behind it. Slower here
+on purpose. If you want it faster again, `-equity-strategy` doesn't expose
+custom arms yet — open an issue or edit `wireEquityAuto` in `cmd/mdp/main.go`.
 
 **`-equity-strategy llm+adaptive`** puts Claude in the loop: needs
 `ANTHROPIC_API_KEY`. Each evaluation, the model sees recent price history
@@ -335,14 +339,23 @@ under 5 minutes.
 **Be honest with yourself about "trade often."** How many trades an hour
 actually happen depends on real price movement, not a schedule — this
 engine has no quota and will not manufacture a trade just to hit a number.
-Short SMA arms on 30-second-sampled quotes *will* fire often, but that also
-means it's the most whipsaw-prone, most fee-sensitive setup in this
+Short SMA arms on frequently-sampled quotes *will* fire often, but that
+also means it's the most whipsaw-prone, most fee-sensitive setup in this
 repository. It stays paper-only by default via the same interlock as the
 rest of the Alpaca integration. If you ever do point this at a live
 account: trading this frequently will run into Alpaca's/FINRA's Pattern Day
 Trader rule (4+ day trades in 5 business days requires $25k equity) well
 within the first day — this is not something to run against real money
 without understanding that first.
+
+**Nothing in this repository, tuned any way, makes money a guaranteed
+outcome.** Slower arms and wider eval intervals fix a specific, real
+problem — paying the spread over and over on noise with no edge behind it —
+they do not turn a mechanical rule or an LLM opinion into a forecast. Every
+strategy here (including `llm`/`llm+adaptive`) is a baseline to compare
+against, documented as such throughout this README, not something to expect
+a positive return from. Treat any tool that claims otherwise, including this
+one, with suspicion.
 
 ---
 

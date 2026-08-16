@@ -199,7 +199,7 @@ func run() error {
 	flag.StringVar(&c.alpacaBaseURL, "alpaca-base-url", env("MDP_ALPACA_BASE_URL", alpaca.PaperBaseURL), "Alpaca API base URL; changing this away from the paper endpoint also requires -alpaca-allow-live")
 	flag.BoolVar(&c.alpacaAllowLive, "alpaca-allow-live", envBool("MDP_ALPACA_ALLOW_LIVE", false), "required in addition to a non-paper -alpaca-base-url before any real-money order can be sent")
 	flag.Float64Var(&c.alpacaMaxPosition, "alpaca-max-position", envFloat("MDP_ALPACA_MAX_POSITION", 0.1), "max fraction of account equity per Alpaca position")
-	flag.DurationVar(&c.alpacaEvalEvery, "alpaca-eval-interval", envDur("MDP_ALPACA_EVAL_INTERVAL", 2*time.Minute), "how often the Alpaca engine evaluates and can trade")
+	flag.DurationVar(&c.alpacaEvalEvery, "alpaca-eval-interval", envDur("MDP_ALPACA_EVAL_INTERVAL", 5*time.Minute), "how often the Alpaca engine evaluates and can trade")
 
 	flag.BoolVar(&c.telegramEnabled, "telegram", envBool("MDP_TELEGRAM", false), "enable a Telegram bot that places real Alpaca orders from chat messages (needs TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALPACA_API_KEY, ALPACA_API_SECRET)")
 	flag.Int64Var(&c.telegramChatID, "telegram-chat-id", int64(envInt("TELEGRAM_CHAT_ID", 0)), "the only chat ID the bot will act on — see GETTING_STARTED.md for how to find yours")
@@ -208,9 +208,9 @@ func run() error {
 	flag.BoolVar(&c.equityAutoEnabled, "equity-auto", envBool("MDP_EQUITY_AUTO", false), "automatically trade a basket of stocks through Alpaca using the adaptive bandit strategy (needs ALPACA_API_KEY, ALPACA_API_SECRET)")
 	flag.StringVar(&c.equitySymbols, "equity-symbols", env("MDP_EQUITY_SYMBOLS", "AAPL,MSFT,NVDA,TSLA,AMD,META,AMZN,GOOGL,NFLX,COIN"), "comma-separated stock tickers to trade")
 	flag.StringVar(&c.equityStrategy, "equity-strategy", env("MDP_EQUITY_STRATEGY", "adaptive"), "adaptive, llm, or llm+adaptive (llm variants need ANTHROPIC_API_KEY) — which decision rule drives the stock basket")
-	flag.DurationVar(&c.equityPollEvery, "equity-poll-interval", envDur("MDP_EQUITY_POLL_INTERVAL", 30*time.Second), "how often each symbol's quote is sampled into this engine's own price history")
-	flag.DurationVar(&c.equityEvalEvery, "equity-eval-interval", envDur("MDP_EQUITY_EVAL_INTERVAL", 60*time.Second), "how often the strategy runs across the basket")
-	flag.Float64Var(&c.equityMaxPosition, "equity-max-position", envFloat("MDP_EQUITY_MAX_POSITION", 0.05), "max fraction of account equity per stock position — kept small since several can be held at once")
+	flag.DurationVar(&c.equityPollEvery, "equity-poll-interval", envDur("MDP_EQUITY_POLL_INTERVAL", time.Minute), "how often each symbol's quote is sampled into this engine's own price history")
+	flag.DurationVar(&c.equityEvalEvery, "equity-eval-interval", envDur("MDP_EQUITY_EVAL_INTERVAL", 5*time.Minute), "how often the strategy runs across the basket")
+	flag.Float64Var(&c.equityMaxPosition, "equity-max-position", envFloat("MDP_EQUITY_MAX_POSITION", 0.03), "max fraction of account equity per stock position — kept small since several can be held at once")
 	flag.Parse()
 
 	log := newLogger(c.logLevel)
@@ -669,13 +669,16 @@ func wireEquityAuto(ctx context.Context, c config, log *slog.Logger, g *errgroup
 	var err error
 	switch c.equityStrategy {
 	case "", "adaptive":
-		// Faster-tuned than buildStrategy's generic default: shorter arms
-		// and a higher exploration rate, since this engine is explicitly
-		// meant to trade often across a basket rather than sit on one
-		// long-lived call.
+		// Was tuned much faster (down to a 1/3 arm) — that traded often, as
+		// asked, but on a poll-sampled feed "often" mostly meant flipping on
+		// noise and paying the bid-ask spread each time with no edge behind
+		// it. Slower arms here, closer to the crypto side's own default:
+		// still faster than the crypto engine (this basket has more symbols
+		// to spread risk across), just no longer the noisiest possible
+		// setup in the repository.
 		strat = strategy.NewAdaptive([]strategy.AdaptiveArm{
-			{Fast: 1, Slow: 3}, {Fast: 2, Slow: 5}, {Fast: 3, Slow: 8}, {Fast: 5, Slow: 13},
-		}, 0.2, 0.6)
+			{Fast: 3, Slow: 9}, {Fast: 5, Slow: 15}, {Fast: 8, Slow: 21}, {Fast: 13, Slow: 34},
+		}, 0.15, 0.7)
 	default:
 		strat, err = buildStrategy(c.equityStrategy, c, log)
 		if err != nil {
